@@ -85,8 +85,8 @@ class Session:
         if self.instructions:
             self.messages.append(SystemMessage(self.instructions))
 
-    def ask(self, prompt: str, model: BaseChatModel) -> None:
-        """Run one user turn with the explicitly supplied model."""
+    def send_sync(self, prompt: str, model: BaseChatModel) -> None:
+        """Send one user message from code without an active event loop."""
         text = prompt.strip()
         if not text:
             raise ValueError("prompt cannot be empty")
@@ -117,8 +117,8 @@ class Session:
                     )
                 )
 
-    async def aask(self, prompt: str, model: BaseChatModel) -> None:
-        """Run one user turn asynchronously for notebook and event-loop frontends."""
+    async def send(self, prompt: str, model: BaseChatModel) -> None:
+        """Send one user message from an interactive IPython frontend."""
         text = prompt.strip()
         if not text:
             raise ValueError("prompt cannot be empty")

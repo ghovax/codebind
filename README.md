@@ -27,7 +27,7 @@ It opens standard IPython with `chat` and `Models` in the user namespace. All no
 ```python
 models = Models({"openai": "OPENAI_API_KEY"})
 
-chat.ask(
+await chat.send(
     "Inspect this project and tell me what to implement first.",
     models.chat("openai/gpt-5", reasoning_effort="medium"),
 )
@@ -51,7 +51,7 @@ Load Codebind in a notebook:
 
 models = Models({"openai": "OPENAI_API_KEY"})
 model = models.chat("openai/gpt-5")
-await chat.aask("Inspect the current notebook state.", model)
+await chat.send("Inspect the current notebook state.", model)
 ```
 
 Codebind publishes cells, assistant Markdown, stdout, tracebacks, and rich results through IPython's MIME display system. The active frontend decides how to render HTML, Markdown, images, SVG, audio, tables, and plain text.
@@ -70,7 +70,7 @@ authorization = await models.sign_in("openai")
 webbrowser.open(authorization.url)
 await authorization.complete()
 
-chat.ask(
+await chat.send(
     "Inspect this project.",
     models.chat("openai/gpt-5", authorization=authorization),
 )
