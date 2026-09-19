@@ -77,7 +77,6 @@ class Session:
         self.instructions = instructions.strip() if instructions else None
         self.messages: list[BaseMessage] = []
         self.last_response: AIMessage | None = None
-        self.cell_number = 0
         if self.instructions:
             self.messages.append(SystemMessage(self.instructions))
 
@@ -85,7 +84,6 @@ class Session:
         """Clear conversation history without clearing the shared Python namespace."""
         self.messages.clear()
         self.last_response = None
-        self.cell_number = 0
         if self.instructions:
             self.messages.append(SystemMessage(self.instructions))
 
@@ -136,12 +134,11 @@ class Session:
             return _tool_error("InvalidArguments", "ipython requires a string cell argument")
 
         cell = arguments["cell"]
-        self.cell_number += 1
-        prompts = CellPrompts(self.shell, self.cell_number)
+        prompts = CellPrompts(self.shell, self.shell.execution_count - 1)
         render_cell(self.shell, cell, prompts)
         try:
             report = self.executor.execute(cell, prompts=prompts)
         except Exception as error:  # The failure must be returned to the model, not end the session.
             report = _tool_error(type(error).__name__, str(error))
-        self.renderer.tool_output(report)
+        self.renderer.tool_output(report, self.shell, prompts)
         return report

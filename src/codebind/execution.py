@@ -39,14 +39,18 @@ class IPythonExecutor:
             raise ValueError("cell must be a non-empty string")
 
         original_prompts = getattr(self.shell, "prompts", None)
+        displayhook = self.shell.displayhook
+        original_output_prompt = displayhook.write_output_prompt
         if prompts is not None and original_prompts is not None:
             self.shell.prompts = prompts
+            displayhook.write_output_prompt = lambda: None
         try:
             with capture_output() as captured:
                 result = self.shell.run_cell(cell, store_history=False)
         finally:
             if prompts is not None and original_prompts is not None:
                 self.shell.prompts = original_prompts
+                displayhook.write_output_prompt = original_output_prompt
 
         displays: list[str] = []
         for output in captured.outputs:

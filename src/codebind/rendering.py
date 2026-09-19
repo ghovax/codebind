@@ -10,9 +10,10 @@ from rich.segment import Segments
 from rich.text import Text
 
 from .execution import ExecutionReport
+from .prompts import CellPrompts, render_output_prompt
 
 
-_MAX_OUTPUT_LINES = 10
+_MAXIMUM_OUTPUT_LINES = 10
 
 
 def _visible_output(report: ExecutionReport) -> str:
@@ -32,7 +33,7 @@ class TerminalRenderer:
     def __init__(self) -> None:
         self.console = Console()
 
-    def tool_output(self, report: ExecutionReport) -> None:
+    def tool_output(self, report: ExecutionReport, shell: object, prompts: CellPrompts) -> None:
         """Show a bounded preview while leaving the report itself intact for the model."""
         visible = _visible_output(report)
         if not visible:
@@ -40,7 +41,9 @@ class TerminalRenderer:
         output = Text.from_ansi(visible)
         options = self.console.options
         complete = self.console.render_lines(output, options, pad=False, new_lines=True)
-        preview = complete[:_MAX_OUTPUT_LINES]
+        preview = complete[:_MAXIMUM_OUTPUT_LINES]
+        if report.ok:
+            render_output_prompt(shell, prompts)
         self.console.print(Segments(chain.from_iterable(preview)), end="")
         if len(complete) > len(preview):
             self.console.print(
