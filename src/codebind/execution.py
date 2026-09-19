@@ -8,6 +8,9 @@ from typing import Any
 from IPython.core.interactiveshell import InteractiveShell
 from IPython.utils.capture import capture_output
 
+from .display import display_cell
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionReport:
     """The model-facing result of one IPython cell."""
@@ -31,18 +34,37 @@ class IPythonExecutor:
         self.shell = shell
 
     def execute(self, cell: str) -> ExecutionReport:
-        """Execute a cell, replay its visible output, and capture a structured result."""
+        """Execute a cell through IPython and replay its native rich output."""
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError("cell must be a non-empty string")
 
-        displayhook = self.shell.displayhook
-        original_output_prompt = displayhook.write_output_prompt
-        displayhook.write_output_prompt = lambda: None
-        try:
-            with capture_output() as captured:
-                result = self.shell.run_cell(cell, store_history=True)
-        finally:
-            displayhook.write_output_prompt = original_output_prompt
+        display_cell(cell)
+        with capture_output() as captured:
+            result = self.shell.run_cell(cell, store_history=True)
+        captured.show()
+
+        return self._report(result, captured)
+
+    async def aexecute(self, cell: str) -> ExecutionReport:
+        """Execute an async-capable cell and replay its native rich output."""
+        if not isinstance(cell, str) or not cell.strip():
+            raise ValueError("cell must be a non-empty string")
+
+        display_cell(cell)
+        transformed = self.shell.transform_cell(cell)
+        with capture_output() as captured:
+            result = await self.shell.run_cell_async(
+                cell,
+                store_history=True,
+                transformed_cell=transformed,
+            )
+        captured.show()
+
+        return self._report(result, captured)
+
+    @staticmethod
+    def _report(result: Any, captured: Any) -> ExecutionReport:
+        """Build the model-facing text projection of an IPython execution."""
 
         displays: list[str] = []
         for output in captured.outputs:
