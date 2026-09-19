@@ -40,4 +40,4 @@ class TerminalRenderer:
     def assistant(self, text: str) -> None:
         """Render the final model response as terminal Markdown."""
         self.console.print()
-        self.console.print(Markdown(text))
+        self.console.print(Markdown(f"---\n\n{text}\n\n---"))
