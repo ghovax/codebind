@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import Runnable
 
 from .execution import ExecutionReport, IPythonExecutor
-from .prompts import CellPrompts, render_cell
+from .prompts import render_cell
 from .rendering import TerminalRenderer
 
 
@@ -134,11 +134,10 @@ class Session:
             return _tool_error("InvalidArguments", "ipython requires a string cell argument")
 
         cell = arguments["cell"]
-        prompts = CellPrompts(self.shell, self.shell.execution_count - 1)
-        render_cell(self.shell, cell, prompts)
+        render_cell(self.shell, cell)
         try:
-            report = self.executor.execute(cell, prompts=prompts)
+            report = self.executor.execute(cell)
         except Exception as error:  # The failure must be returned to the model, not end the session.
             report = _tool_error(type(error).__name__, str(error))
-        self.renderer.tool_output(report, self.shell, prompts)
+        self.renderer.tool_output(report, self.shell)
         return report

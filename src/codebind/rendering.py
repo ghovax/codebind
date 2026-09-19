@@ -7,7 +7,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from .execution import ExecutionReport
-from .prompts import CellPrompts, render_output_prompt
+from .prompts import render_output_prompt
 
 
 def _visible_output(report: ExecutionReport) -> str:
@@ -27,14 +27,14 @@ class TerminalRenderer:
     def __init__(self) -> None:
         self.console = Console()
 
-    def tool_output(self, report: ExecutionReport, shell: object, prompts: CellPrompts) -> None:
+    def tool_output(self, report: ExecutionReport, shell: object) -> None:
         """Show the complete tool output."""
         visible = _visible_output(report)
         if not visible:
             return
         output = Text.from_ansi(visible)
         if report.ok:
-            render_output_prompt(shell, prompts)
+            render_output_prompt(shell)
         self.console.print(output)
 
     def assistant(self, text: str) -> None:
