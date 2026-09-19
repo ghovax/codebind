@@ -1,6 +1,6 @@
 [project]
 name = "codebind"
-version = "0.1.0"
+version = "0.1.1"
 description = "A minimal model loop over a persistent IPython session."
 readme = "README.md"
 authors = [
