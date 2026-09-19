@@ -2,7 +2,7 @@
 
 from importlib.metadata import version
 
-from .execution import ExecutionReport, PythonExecutor
+from .execution import ExecutionReport, IPythonExecutor
 from .session import Session
 
 
@@ -10,7 +10,7 @@ __version__ = version("codebind")
 
 __all__ = [
     "ExecutionReport",
-    "PythonExecutor",
+    "IPythonExecutor",
     "Session",
     "__version__",
 ]
