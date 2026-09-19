@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from IPython.terminal.prompts import Prompts
 from IPython.terminal.ptutils import IPythonPTLexer
 from prompt_toolkit.document import Document
@@ -44,6 +46,7 @@ def render_cell(shell: object, cell: str, prompts: CellPrompts) -> None:
     lexer = IPythonPTLexer().lex_document(Document(cell))
     pt_app = getattr(shell, "pt_app", None)
     style = pt_app.app.style if pt_app is not None else None
+    sys.stdout.write(getattr(shell, "separate_in", "\n"))
 
     for index, _line in enumerate(cell.split("\n")):
         prompt_tokens = (
@@ -53,3 +56,10 @@ def render_cell(shell: object, cell: str, prompts: CellPrompts) -> None:
         )
         print_formatted_text(PygmentsTokens(prompt_tokens), style=style, end="")
         print_formatted_text(FormattedText(lexer(index)), style=style)
+
+
+def render_output_prompt(shell: object, prompts: CellPrompts) -> None:
+    """Render an output prompt with IPython's terminal style."""
+    pt_app = getattr(shell, "pt_app", None)
+    style = pt_app.app.style if pt_app is not None else None
+    print_formatted_text(PygmentsTokens(prompts.out_prompt_tokens()), style=style, end="")
