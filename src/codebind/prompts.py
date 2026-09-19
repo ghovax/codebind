@@ -62,4 +62,5 @@ def render_output_prompt(shell: object, prompts: CellPrompts) -> None:
     """Render an output prompt with IPython's terminal style."""
     pt_app = getattr(shell, "pt_app", None)
     style = pt_app.app.style if pt_app is not None else None
+    sys.stdout.write(getattr(shell, "separate_out", "") or "\n")
     print_formatted_text(PygmentsTokens(prompts.out_prompt_tokens()), style=style, end="")
