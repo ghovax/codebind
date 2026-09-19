@@ -7,12 +7,28 @@ authors = [
     { name = "Giovanni Gravili", email = "ghovax@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["ai", "ipython", "llm", "repl", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
 dependencies = [
     "ipython>=9.0",
     "langchain-core>=1.0",
-    "models-provider",
+    "models-provider>=0.1.0",
     "rich>=14.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/ghovax/codebind"
+Issues = "https://github.com/ghovax/codebind/issues"
 
 [project.scripts]
 codebind = "codebind.cli:main"

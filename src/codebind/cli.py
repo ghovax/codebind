@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 from IPython.core.interactiveshell import InteractiveShell
@@ -10,6 +11,7 @@ from models_provider import Models
 from rich.console import Console
 from rich.markdown import Markdown
 
+from . import __version__
 from .session import Session
 
 
@@ -29,6 +31,10 @@ def namespace(shell: InteractiveShell) -> dict[str, Any]:
 
 def main() -> None:
     """Start IPython in the current directory with Codebind preloaded."""
+    parser = argparse.ArgumentParser(description="Start a model-enabled IPython session.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.parse_args()
+
     Console().print(Markdown(BANNER))
     application = TerminalIPythonApp.instance()
     application.display_banner = False
