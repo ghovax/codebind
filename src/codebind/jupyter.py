@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from IPython.core.interactiveshell import InteractiveShell
 
@@ -25,7 +26,7 @@ class JupyterLabBridge:
             return None
 
         try:
-            from comm import create_comm
+            from comm import create_comm  # pyright: ignore[reportMissingImports]
 
             return cls(create_comm(target_name=_TARGET_NAME))
         except (ImportError, RuntimeError):
@@ -36,21 +37,61 @@ class JupyterLabBridge:
         self._comm.close()
         self.ready = False
 
-    def insert_code_cell(
+    def start_code_cell(self, source: str) -> str | None:
+        """Insert a running code cell before its execution begins."""
+        if not self.ready:
+            return None
+        cell_id = str(uuid4())
+        self._comm.send(
+            {
+                "type": "code_cell_started",
+                "cell_id": cell_id,
+                "source": source,
+            }
+        )
+        return cell_id
+
+    def finish_code_cell(
         self,
-        source: str,
+        cell_id: str,
         execution_count: int | None,
         outputs: list[dict[str, Any]],
     ) -> bool:
-        """Insert one executed code cell through JupyterLab."""
+        """Finish a previously inserted code cell with its native outputs."""
         if not self.ready:
             return False
         self._comm.send(
             {
-                "type": "code_cell",
-                "source": source,
+                "type": "code_cell_finished",
+                "cell_id": cell_id,
                 "execution_count": execution_count,
                 "outputs": outputs,
+            }
+        )
+        return True
+
+    def append_code_output(self, cell_id: str, output: dict[str, Any]) -> bool:
+        """Append one live output to a running code cell."""
+        if not self.ready:
+            return False
+        self._comm.send(
+            {
+                "type": "code_cell_output",
+                "cell_id": cell_id,
+                "output": output,
+            }
+        )
+        return True
+
+    def clear_code_output(self, cell_id: str, *, wait: bool = False) -> bool:
+        """Clear a running code cell's outputs."""
+        if not self.ready:
+            return False
+        self._comm.send(
+            {
+                "type": "code_cell_clear",
+                "cell_id": cell_id,
+                "wait": wait,
             }
         )
         return True

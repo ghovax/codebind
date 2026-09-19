@@ -13,11 +13,29 @@ import { Kernel, KernelMessage } from '@jupyterlab/services';
 
 const TARGET_NAME = 'codebind';
 
-interface CodeCellMessage {
-  type: 'code_cell';
+interface CodeCellStartedMessage {
+  type: 'code_cell_started';
+  cell_id: string;
   source: string;
+}
+
+interface CodeCellFinishedMessage {
+  type: 'code_cell_finished';
+  cell_id: string;
   execution_count: number | null;
   outputs: nbformat.IOutput[];
+}
+
+interface CodeCellOutputMessage {
+  type: 'code_cell_output';
+  cell_id: string;
+  output: nbformat.IOutput;
+}
+
+interface CodeCellClearMessage {
+  type: 'code_cell_clear';
+  cell_id: string;
+  wait: boolean;
 }
 
 interface MarkdownCellMessage {
@@ -25,7 +43,13 @@ interface MarkdownCellMessage {
   source: string;
 }
 
-type CodebindMessage = CodeCellMessage | MarkdownCellMessage;
+type CodebindMessage =
+  | CodeCellStartedMessage
+  | CodeCellFinishedMessage
+  | CodeCellOutputMessage
+  | CodeCellClearMessage
+  | MarkdownCellMessage;
+type InsertMessage = CodeCellStartedMessage | MarkdownCellMessage;
 
 interface TurnState {
   parentModel: ICodeCellModel | null;
@@ -42,9 +66,25 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
   if (message.type === 'markdown_cell') {
     return typeof message.source === 'string';
   }
+  if (message.type === 'code_cell_started') {
+    return (
+      typeof message.cell_id === 'string' &&
+      typeof message.source === 'string'
+    );
+  }
+  if (message.type === 'code_cell_output') {
+    return (
+      typeof message.cell_id === 'string' &&
+      typeof message.output === 'object' &&
+      message.output !== null
+    );
+  }
+  if (message.type === 'code_cell_clear') {
+    return typeof message.cell_id === 'string' && typeof message.wait === 'boolean';
+  }
   return (
-    message.type === 'code_cell' &&
-    typeof message.source === 'string' &&
+    message.type === 'code_cell_finished' &&
+    typeof message.cell_id === 'string' &&
     (typeof message.execution_count === 'number' ||
       message.execution_count === null) &&
     Array.isArray(message.outputs)
@@ -53,22 +93,22 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
 
 function insertCell(
   panel: NotebookPanel,
-  message: CodebindMessage,
+  message: InsertMessage,
   index: number
-): void {
+): ICellModel | null {
   const notebook = panel.content;
   const model = notebook.model;
   if (!model) {
-    return;
+    return null;
   }
 
-  if (message.type === 'code_cell') {
+  if (message.type === 'code_cell_started') {
     model.sharedModel.insertCell(index, {
       cell_type: 'code',
       source: message.source,
       metadata: { trusted: true },
-      execution_count: message.execution_count,
-      outputs: message.outputs
+      execution_count: null,
+      outputs: []
     });
   } else {
     model.sharedModel.insertCell(index, {
@@ -84,6 +124,7 @@ function insertCell(
     void NotebookActions.run(notebook);
   }
   void notebook.scrollToItem(index);
+  return notebook.widgets[index]?.model ?? null;
 }
 
 function registerKernel(panel: NotebookPanel): void {
@@ -93,6 +134,7 @@ function registerKernel(panel: NotebookPanel): void {
   }
 
   let turn: TurnState | null = null;
+  const codeCells = new Map<string, ICodeCellModel>();
 
   const finishTurn = (): void => {
     if (!turn) {
@@ -117,7 +159,7 @@ function registerKernel(panel: NotebookPanel): void {
     }
   };
 
-  const beginTurn = (message: CodebindMessage): TurnState => {
+  const beginTurn = (): TurnState => {
     if (turn) {
       return turn;
     }
@@ -133,10 +175,7 @@ function registerKernel(panel: NotebookPanel): void {
         : null;
     turn = {
       parentModel,
-      parentExecutionCount:
-        message.type === 'code_cell' && message.execution_count !== null
-          ? message.execution_count - 1
-          : null,
+      parentExecutionCount: null,
       resumeModel: notebook.activeCell?.model ?? null,
       nextIndex:
         parentIndex >= 0
@@ -164,11 +203,43 @@ function registerKernel(panel: NotebookPanel): void {
     (comm: Kernel.IComm, _message: KernelMessage.ICommOpenMsg) => {
       comm.onMsg = (message: KernelMessage.ICommMsgMsg) => {
         const data = message.content.data;
-        if (isCodebindMessage(data)) {
-          const activeTurn = beginTurn(data);
-          insertCell(panel, data, activeTurn.nextIndex);
-          activeTurn.nextIndex += 1;
+        if (!isCodebindMessage(data)) {
+          return;
         }
+        if (data.type === 'code_cell_output') {
+          codeCells.get(data.cell_id)?.outputs.add(data.output);
+          return;
+        }
+        if (data.type === 'code_cell_clear') {
+          codeCells.get(data.cell_id)?.outputs.clear(data.wait);
+          return;
+        }
+        if (data.type === 'code_cell_finished') {
+          const model = codeCells.get(data.cell_id);
+          if (!model) {
+            return;
+          }
+          model.outputs.fromJSON(data.outputs);
+          model.executionCount = data.execution_count;
+          model.executionState = 'idle';
+          if (
+            turn &&
+            turn.parentExecutionCount === null &&
+            data.execution_count !== null
+          ) {
+            turn.parentExecutionCount = data.execution_count - 1;
+          }
+          return;
+        }
+
+        const activeTurn = beginTurn();
+        const model = insertCell(panel, data, activeTurn.nextIndex);
+        if (data.type === 'code_cell_started' && model?.type === 'code') {
+          const code = model as ICodeCellModel;
+          code.executionState = 'running';
+          codeCells.set(data.cell_id, code);
+        }
+        activeTurn.nextIndex += 1;
       };
       comm.send({ type: 'ready' });
     }
