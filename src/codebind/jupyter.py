@@ -25,7 +25,7 @@ class JupyterLabBridge:
             return None
 
         try:
-            from comm import create_comm
+            from comm import create_comm  # pyright: ignore[reportMissingImports]
 
             return cls(create_comm(target_name=_TARGET_NAME))
         except (ImportError, RuntimeError):

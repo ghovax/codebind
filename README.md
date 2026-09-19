@@ -35,12 +35,38 @@ chat.send(
 
 Codebind does not load files or construct a project prompt automatically. The user states what should be loaded as context. Pass `instructions=` to `Session` only when an application needs its own system instructions.
 
+## Invocations
+
+`send()` and `asend()` run one visible agent invocation, including every repeated model and IPython step required to reach a final response. `invoke()` starts an independent invocation with its own history and returns an awaitable handle:
+
+```python
+import asyncio
+
+first = chat.invoke("Review the API.", model)
+second = chat.invoke("Review the packaging.", model)
+
+first_outcome, second_outcome = await asyncio.gather(first, second)
+```
+
+Fork explicitly from an immutable history snapshot:
+
+```python
+branch = chat.invoke(
+    "Try a different solution.",
+    model,
+    history=first.history,
+)
+outcome = await branch
+```
+
+Each invocation has an `id`, `parent_id`, `history`, `status`, and one terminal `outcome`. Waiting, parallelism, and joining results remain ordinary Python operations.
+
 ## Jupyter
 
 Start JupyterLab with Codebind from any directory without a permanent installation:
 
 ```console
-uvx --from jupyterlab --with codebind jupyter lab
+uvx --from jupyterlab --with codebind jupyter-lab
 ```
 
 Or install both packages into the same environment, then start JupyterLab normally:

@@ -12,6 +12,7 @@ from IPython.core.interactiveshell import InteractiveShell
 from IPython.utils.capture import capture_output
 
 from .display import display_cell
+from .invocation import InvocationRegistry
 from .jupyter import JupyterLabBridge
 
 
@@ -34,9 +35,16 @@ class ExecutionReport:
 class _ExecutionDisplayHook:
     """Capture an expression result while preserving IPython output history."""
 
-    def __init__(self, shell: InteractiveShell, outputs: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        shell: InteractiveShell,
+        outputs: list[dict[str, Any]],
+        *,
+        record_history: bool,
+    ) -> None:
         self.shell = shell
         self.outputs = outputs
+        self.record_history = record_history
 
     def __call__(self, value: Any = None) -> None:
         if value is None:
@@ -46,10 +54,11 @@ class _ExecutionDisplayHook:
         if displayhook.quiet():
             return
         data, metadata = displayhook.compute_format_data(value)
-        displayhook.update_user_ns(value)
         displayhook.fill_exec_result(value)
         if data:
-            displayhook.log_output(data)
+            if self.record_history:
+                displayhook.update_user_ns(value)
+                displayhook.log_output(data)
             self.outputs.append({"data": data, "metadata": metadata})
 
 
@@ -58,18 +67,23 @@ def _captured_execution(
     shell: InteractiveShell,
     expression_outputs: list[dict[str, Any]],
     *,
-    bridged: bool,
+    suppress: bool,
+    record_history: bool,
 ) -> Iterator[Any]:
     """Capture one nested execution without leaking its output to the parent cell."""
     with capture_output() as captured:
-        if not bridged:
+        if not suppress:
             yield captured
             return
 
         previous_displayhook = sys.displayhook
         previous_showtraceback = shell.showtraceback
         previous_showsyntaxerror = shell.showsyntaxerror
-        sys.displayhook = _ExecutionDisplayHook(shell, expression_outputs)
+        sys.displayhook = _ExecutionDisplayHook(
+            shell,
+            expression_outputs,
+            record_history=record_history,
+        )
         shell.showtraceback = lambda *args, **kwargs: None
         shell.showsyntaxerror = lambda *args, **kwargs: None
         try:
@@ -87,32 +101,40 @@ class IPythonExecutor:
         self,
         shell: InteractiveShell,
         bridge: JupyterLabBridge | None = None,
+        *,
+        visible: bool = True,
+        registry: InvocationRegistry | None = None,
     ) -> None:
         self.shell = shell
         self.bridge = bridge
+        self.visible = visible
+        self.registry = registry or InvocationRegistry()
 
     def execute(self, cell: str) -> ExecutionReport:
         """Execute a cell through IPython and replay its native rich output."""
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError("cell must be a non-empty string")
 
-        bridged = self.bridge is not None and self.bridge.ready
-        if not bridged:
+        bridge = self.bridge
+        bridged = self.visible and bridge is not None and bridge.ready
+        if self.visible and not bridged:
             display_cell(cell)
         expression_outputs: list[dict[str, Any]] = []
         with _captured_execution(
             self.shell,
             expression_outputs,
-            bridged=bridged,
+            suppress=bridged or not self.visible,
+            record_history=self.visible,
         ) as captured:
-            result = self.shell.run_cell(cell, store_history=True)
+            result = self.shell.run_cell(cell, store_history=self.visible)
         if bridged:
-            self.bridge.insert_code_cell(
+            assert bridge is not None
+            bridge.insert_code_cell(
                 cell,
                 result.execution_count,
                 self._notebook_outputs(result, captured, expression_outputs),
             )
-        else:
+        elif self.visible:
             captured.show()
 
         return self._report(result, captured)
@@ -122,28 +144,32 @@ class IPythonExecutor:
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError("cell must be a non-empty string")
 
-        bridged = self.bridge is not None and self.bridge.ready
-        if not bridged:
+        bridge = self.bridge
+        bridged = self.visible and bridge is not None and bridge.ready
+        if self.visible and not bridged:
             display_cell(cell)
         transformed = self.shell.transform_cell(cell)
         expression_outputs: list[dict[str, Any]] = []
-        with _captured_execution(
-            self.shell,
-            expression_outputs,
-            bridged=bridged,
-        ) as captured:
-            result = await self.shell.run_cell_async(
-                cell,
-                store_history=True,
-                transformed_cell=transformed,
-            )
+        async with self.registry.execution():
+            with _captured_execution(
+                self.shell,
+                expression_outputs,
+                suppress=bridged or not self.visible,
+                record_history=self.visible,
+            ) as captured:
+                result = await self.shell.run_cell_async(
+                    cell,
+                    store_history=self.visible,
+                    transformed_cell=transformed,
+                )
         if bridged:
-            self.bridge.insert_code_cell(
+            assert bridge is not None
+            bridge.insert_code_cell(
                 cell,
                 result.execution_count,
                 self._notebook_outputs(result, captured, expression_outputs),
             )
-        else:
+        elif self.visible:
             captured.show()
 
         return self._report(result, captured)

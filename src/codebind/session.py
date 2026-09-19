@@ -15,6 +15,7 @@ from langchain_core.runnables import Runnable
 
 from .display import display_assistant
 from .execution import ExecutionReport, IPythonExecutor
+from .invocation import Invocation, InvocationRegistry, Outcome, message_text
 from .jupyter import JupyterLabBridge
 
 
@@ -40,21 +41,6 @@ IPYTHON_TOOL = {
 }
 
 
-def _message_text(message: AIMessage) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, Sequence) or isinstance(content, (bytes, bytearray, str)):
-        return str(content)
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append(block)
-        elif isinstance(block, Mapping) and isinstance(block.get("text"), str):
-            parts.append(block["text"])
-    return "".join(parts)
-
-
 def _tool_error(error_type: str, message: str) -> ExecutionReport:
     return ExecutionReport(False, "", "", None, (), {"type": error_type, "message": message})
 
@@ -68,6 +54,8 @@ class Session:
         shell: InteractiveShell | None = None,
         instructions: str | None = None,
         bridge: JupyterLabBridge | None = None,
+        _visible: bool = True,
+        _registry: InvocationRegistry | None = None,
     ) -> None:
         resolved_shell = shell or get_ipython()
         if resolved_shell is None:
@@ -75,12 +63,24 @@ class Session:
 
         self.shell = resolved_shell
         self.bridge = bridge
-        self.executor = IPythonExecutor(resolved_shell, bridge)
+        self._visible = _visible
+        self._registry = _registry or InvocationRegistry()
+        self.executor = IPythonExecutor(
+            resolved_shell,
+            bridge,
+            visible=_visible,
+            registry=self._registry,
+        )
         self.instructions = instructions.strip() if instructions else None
         self.messages: list[BaseMessage] = []
         self.last_response: AIMessage | None = None
         if self.instructions:
             self.messages.append(SystemMessage(self.instructions))
+
+    @property
+    def invocations(self) -> tuple[Invocation, ...]:
+        """Return every invocation created by this runtime in creation order."""
+        return self._registry.invocations
 
     def clear(self) -> None:
         """Clear conversation history without clearing the shared Python namespace."""
@@ -89,8 +89,34 @@ class Session:
         if self.instructions:
             self.messages.append(SystemMessage(self.instructions))
 
+    def invoke(
+        self,
+        prompt: str,
+        model: BaseChatModel,
+        *,
+        history: Sequence[BaseMessage] = (),
+    ) -> Invocation:
+        """Start an independent agent invocation from an immutable history snapshot."""
+        text = self._validate_prompt(prompt)
+        starting_history = tuple(history)
+        if not all(isinstance(message, BaseMessage) for message in starting_history):
+            raise TypeError("history must contain only BaseMessage instances")
+
+        child = Session(
+            shell=self.shell,
+            bridge=None,
+            _visible=False,
+            _registry=self._registry,
+        )
+        child.messages.extend(starting_history)
+
+        async def run(new_history: list[BaseMessage]) -> AIMessage:
+            return await child._arun(text, model, new_history)
+
+        return Invocation(text, starting_history, run, self._registry).start()
+
     def send(self, prompt: str, model: BaseChatModel) -> None:
-        """Send one user message synchronously."""
+        """Run one visible agent invocation synchronously."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -98,67 +124,85 @@ class Session:
         else:
             raise RuntimeError("send() cannot run inside an active event loop; use await asend().")
 
-        text = prompt.strip()
-        if not text:
-            raise ValueError("prompt cannot be empty")
+        text = self._validate_prompt(prompt)
+        invocation = Invocation(text, tuple(self.messages), None, self._registry)
+        with invocation._inline() as new_history:
+            try:
+                response = self._run(text, model, new_history)
+            except BaseException as error:
+                invocation._finish(Outcome("failed", error=error))
+                raise
+            invocation._finish(Outcome("completed", value=response))
 
+    async def asend(self, prompt: str, model: BaseChatModel) -> None:
+        """Run one visible agent invocation asynchronously."""
+        text = self._validate_prompt(prompt)
+        invocation = Invocation(text, tuple(self.messages), None, self._registry)
+        with invocation._inline() as new_history:
+            try:
+                response = await self._arun(text, model, new_history)
+            except asyncio.CancelledError:
+                invocation._finish(Outcome("cancelled"))
+                raise
+            except BaseException as error:
+                invocation._finish(Outcome("failed", error=error))
+                raise
+            invocation._finish(Outcome("completed", value=response))
+
+    def _run(
+        self,
+        prompt: str,
+        model: BaseChatModel,
+        new_history: list[BaseMessage],
+    ) -> AIMessage:
         bound_model = self._bind(model)
-        self.messages.append(HumanMessage(text))
+        self._append(HumanMessage(prompt), new_history)
 
         while True:
             response = bound_model.invoke(tuple(self.messages))
             if not isinstance(response, AIMessage):
                 raise TypeError("model must return an AIMessage")
-            self.messages.append(response)
+            self._append(response, new_history)
             self.last_response = response
 
             if not response.tool_calls:
-                answer = _message_text(response)
-                if answer:
-                    self._display_assistant(answer)
-                return
+                self._finish_response(response)
+                return response
 
             for call in response.tool_calls:
                 report = self._execute_call(call)
-                identifier = str(call.get("id") or f"ipython-{len(self.messages)}")
-                self.messages.append(
-                    ToolMessage(
-                        json.dumps(report.as_dict(), ensure_ascii=False),
-                        tool_call_id=identifier,
-                    )
-                )
+                self._append(self._tool_message(call, report), new_history)
 
-    async def asend(self, prompt: str, model: BaseChatModel) -> None:
-        """Send one user message asynchronously."""
-        text = prompt.strip()
-        if not text:
-            raise ValueError("prompt cannot be empty")
-
+    async def _arun(
+        self,
+        prompt: str,
+        model: BaseChatModel,
+        new_history: list[BaseMessage],
+    ) -> AIMessage:
         bound_model = self._bind(model)
-        self.messages.append(HumanMessage(text))
+        self._append(HumanMessage(prompt), new_history)
 
         while True:
             response = await bound_model.ainvoke(tuple(self.messages))
             if not isinstance(response, AIMessage):
                 raise TypeError("model must return an AIMessage")
-            self.messages.append(response)
+            self._append(response, new_history)
             self.last_response = response
 
             if not response.tool_calls:
-                answer = _message_text(response)
-                if answer:
-                    self._display_assistant(answer)
-                return
+                self._finish_response(response)
+                return response
 
             for call in response.tool_calls:
                 report = await self._aexecute_call(call)
-                identifier = str(call.get("id") or f"ipython-{len(self.messages)}")
-                self.messages.append(
-                    ToolMessage(
-                        json.dumps(report.as_dict(), ensure_ascii=False),
-                        tool_call_id=identifier,
-                    )
-                )
+                self._append(self._tool_message(call, report), new_history)
+
+    @staticmethod
+    def _validate_prompt(prompt: str) -> str:
+        text = prompt.strip()
+        if not text:
+            raise ValueError("prompt cannot be empty")
+        return text
 
     @staticmethod
     def _bind(model: BaseChatModel) -> Runnable[Any, BaseMessage]:
@@ -166,6 +210,23 @@ class Session:
             return model.bind_tools([IPYTHON_TOOL], parallel_tool_calls=False)
         except NotImplementedError:
             return model.bind(tools=[IPYTHON_TOOL], parallel_tool_calls=False)
+
+    def _append(self, message: BaseMessage, new_history: list[BaseMessage]) -> None:
+        self.messages.append(message)
+        new_history.append(message)
+
+    def _finish_response(self, response: AIMessage) -> None:
+        answer = message_text(response)
+        if answer and self._visible:
+            self._display_assistant(answer)
+
+    @staticmethod
+    def _tool_message(call: Mapping[str, Any], report: ExecutionReport) -> ToolMessage:
+        identifier = str(call.get("id") or "ipython")
+        return ToolMessage(
+            json.dumps(report.as_dict(), ensure_ascii=False),
+            tool_call_id=identifier,
+        )
 
     def _display_assistant(self, answer: str) -> None:
         if self.bridge is None or not self.bridge.insert_markdown_cell(answer):
@@ -179,10 +240,9 @@ class Session:
             return _tool_error("InvalidArguments", "ipython requires a string cell argument")
 
         try:
-            report = self.executor.execute(arguments["cell"])
-        except Exception as error:  # The failure must be returned to the model, not end the session.
-            report = _tool_error(type(error).__name__, str(error))
-        return report
+            return self.executor.execute(arguments["cell"])
+        except Exception as error:
+            return _tool_error(type(error).__name__, str(error))
 
     async def _aexecute_call(self, call: Mapping[str, Any]) -> ExecutionReport:
         if call.get("name") != "ipython":
