@@ -2,6 +2,20 @@
 
 Codebind runs a model with one tool: Python executed in the IPython session shared with the user. Conversation history belongs to a `Session`; the model is selected independently for every call.
 
+## Installation
+
+Run Codebind without installing it permanently:
+
+```console
+uvx codebind
+```
+
+Or install it with any Python package installer:
+
+```console
+pip install codebind
+```
+
 After installation, start the preconfigured shell from any directory:
 
 ```console
