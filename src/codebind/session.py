@@ -15,6 +15,7 @@ from langchain_core.runnables import Runnable
 
 from .display import display_assistant
 from .execution import ExecutionReport, IPythonExecutor
+from .jupyter import JupyterLabBridge
 
 
 IPYTHON_TOOL = {
@@ -66,13 +67,15 @@ class Session:
         *,
         shell: InteractiveShell | None = None,
         instructions: str | None = None,
+        bridge: JupyterLabBridge | None = None,
     ) -> None:
         resolved_shell = shell or get_ipython()
         if resolved_shell is None:
             raise RuntimeError("Session must be created inside IPython or given an IPython shell.")
 
         self.shell = resolved_shell
-        self.executor = IPythonExecutor(resolved_shell)
+        self.bridge = bridge
+        self.executor = IPythonExecutor(resolved_shell, bridge)
         self.instructions = instructions.strip() if instructions else None
         self.messages: list[BaseMessage] = []
         self.last_response: AIMessage | None = None
@@ -112,7 +115,7 @@ class Session:
             if not response.tool_calls:
                 answer = _message_text(response)
                 if answer:
-                    display_assistant(answer)
+                    self._display_assistant(answer)
                 return
 
             for call in response.tool_calls:
@@ -144,7 +147,7 @@ class Session:
             if not response.tool_calls:
                 answer = _message_text(response)
                 if answer:
-                    display_assistant(answer)
+                    self._display_assistant(answer)
                 return
 
             for call in response.tool_calls:
@@ -163,6 +166,10 @@ class Session:
             return model.bind_tools([IPYTHON_TOOL], parallel_tool_calls=False)
         except NotImplementedError:
             return model.bind(tools=[IPYTHON_TOOL], parallel_tool_calls=False)
+
+    def _display_assistant(self, answer: str) -> None:
+        if self.bridge is None or not self.bridge.insert_markdown_cell(answer):
+            display_assistant(answer)
 
     def _execute_call(self, call: Mapping[str, Any]) -> ExecutionReport:
         if call.get("name") != "ipython":

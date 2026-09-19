@@ -1,6 +1,6 @@
 [project]
 name = "codebind"
-version = "0.3.0"
+version = "0.4.0"
 description = "A frontend-neutral model loop for persistent IPython sessions."
 readme = "README.md"
 authors = [
@@ -12,6 +12,7 @@ license-files = ["LICENSE"]
 keywords = ["ai", "ipython", "llm", "repl", "agents"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -44,6 +45,17 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "B", "RUF"]
+
+[tool.uv.build-backend]
+data = { data = "data" }
+source-include = [
+    "jupyterlab/.yarnrc.yml",
+    "jupyterlab/install.json",
+    "jupyterlab/package.json",
+    "jupyterlab/src/**",
+    "jupyterlab/tsconfig.json",
+    "jupyterlab/yarn.lock",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

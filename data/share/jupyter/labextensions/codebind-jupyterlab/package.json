@@ -1,0 +1,37 @@
+{
+  "name": "codebind-jupyterlab",
+  "version": "0.4.0",
+  "description": "Native JupyterLab cells for Codebind model executions.",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib/**/*"
+  ],
+  "scripts": {
+    "build": "jlpm run clean && jlpm run build:lib && jupyter-builder build && jlpm run build:install",
+    "build:install": "node -e \"require('node:fs').copyFileSync('install.json', '../data/share/jupyter/labextensions/codebind-jupyterlab/install.json')\"",
+    "build:lib": "tsc",
+    "clean": "rimraf lib tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@jupyterlab/application": "^4.0.0",
+    "@jupyterlab/cells": "^4.0.0",
+    "@jupyterlab/nbformat": "^4.0.0",
+    "@jupyterlab/notebook": "^4.0.0",
+    "@jupyterlab/services": "^7.0.0"
+  },
+  "devDependencies": {
+    "@jupyter/builder": "^1.2.0",
+    "rimraf": "^6.0.0",
+    "typescript": "~5.7.0"
+  },
+  "jupyterlab": {
+    "extension": true,
+    "outputDir": "../data/share/jupyter/labextensions/codebind-jupyterlab",
+    "_build": {
+      "load": "static/remoteEntry.a1fc3d70ac53ef43.js",
+      "extension": "./extension"
+    }
+  }
+}

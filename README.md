@@ -37,7 +37,13 @@ Codebind does not load files or construct a project prompt automatically. The us
 
 ## Jupyter
 
-Install Codebind in the environment used by a Jupyter kernel, then start the Jupyter frontend normally:
+Start JupyterLab with Codebind from any directory without a permanent installation:
+
+```console
+uvx --from jupyterlab --with codebind jupyter lab
+```
+
+Or install both packages into the same environment, then start JupyterLab normally:
 
 ```console
 pip install codebind jupyterlab
@@ -48,15 +54,19 @@ Load Codebind in a notebook:
 
 ```python
 %load_ext codebind
+```
 
+Run that cell once so JupyterLab can connect to the extension, then use Codebind in later cells:
+
+```python
 models = Models({"openai": "OPENAI_API_KEY"})
 model = models.chat("openai/gpt-5")
 await chat.asend("Inspect the current notebook state.", model)
 ```
 
-Codebind publishes cells, assistant Markdown, stdout, tracebacks, and rich results through IPython's MIME display system. The active frontend decides how to render HTML, Markdown, images, SVG, audio, tables, and plain text.
+The Codebind package includes a prebuilt JupyterLab extension. In JupyterLab, each model-authored IPython execution becomes a genuine code cell with its native execution count and outputs, and the assistant response becomes a rendered Markdown cell. The cells are ordinary notebook content and are saved with the notebook.
 
-Model-authored cells are recorded in native IPython history and displayed through the active frontend. A kernel cannot insert a genuine input cell into every possible frontend without a frontend-specific extension, so Codebind does not attempt to control notebook or editor UI.
+Other IPython frontends use the standard MIME display protocol instead. They still receive syntax-highlighted code, assistant Markdown, stdout, tracebacks, rich results, and native IPython history without Codebind depending on their UI.
 
 ## ChatGPT account login
 

@@ -9,3 +9,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+jupyterlab/.yarn/
+jupyterlab/lib/
+jupyterlab/node_modules/
+jupyterlab/tsconfig.tsbuildinfo
