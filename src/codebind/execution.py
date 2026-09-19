@@ -31,6 +31,49 @@ class ExecutionReport:
         """Return a JSON-serializable representation."""
         return asdict(self)
 
+    @classmethod
+    def from_notebook_outputs(cls, outputs: list[dict[str, Any]]) -> ExecutionReport:
+        """Build a model-facing report from standard notebook outputs."""
+        stdout: list[str] = []
+        stderr: list[str] = []
+        displays: list[str] = []
+        result: str | None = None
+        error: dict[str, str] | None = None
+
+        for output in outputs:
+            output_type = output.get("output_type")
+            if output_type == "stream":
+                stream = stdout if output.get("name") == "stdout" else stderr
+                stream.append(_notebook_text(output.get("text")))
+            elif output_type == "execute_result":
+                data = output.get("data")
+                if isinstance(data, dict):
+                    result = _notebook_text(data.get("text/plain"))
+            elif output_type == "display_data":
+                data = output.get("data")
+                if isinstance(data, dict) and "text/plain" in data:
+                    displays.append(_notebook_text(data["text/plain"]))
+            elif output_type == "error":
+                error = {
+                    "type": str(output.get("ename", "Error")),
+                    "message": str(output.get("evalue", "")),
+                }
+
+        return cls(
+            ok=error is None,
+            stdout="".join(stdout),
+            stderr="".join(stderr),
+            result=result,
+            displays=tuple(displays),
+            error=error,
+        )
+
+
+def _notebook_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "".join(str(part) for part in value)
+    return "" if value is None else str(value)
+
 
 class _ExecutionDisplayHook:
     """Capture an expression result while preserving IPython output history."""
@@ -104,11 +147,13 @@ class IPythonExecutor:
         *,
         visible: bool = True,
         registry: InvocationRegistry | None = None,
+        invocation_id: str | None = None,
     ) -> None:
         self.shell = shell
         self.bridge = bridge
         self.visible = visible
         self.registry = registry or InvocationRegistry()
+        self.invocation_id = invocation_id
 
     def execute(self, cell: str) -> ExecutionReport:
         """Execute a cell through IPython and replay its native rich output."""
@@ -145,6 +190,14 @@ class IPythonExecutor:
             raise ValueError("cell must be a non-empty string")
 
         bridge = self.bridge
+        if self.invocation_id is not None and bridge is not None and bridge.ready:
+            async with self.registry.execution():
+                payload = await bridge.execute_cell(self.invocation_id, cell)
+            outputs = payload.get("outputs")
+            if not isinstance(outputs, list):
+                raise TypeError("JupyterLab returned invalid cell outputs")
+            return ExecutionReport.from_notebook_outputs(outputs)
+
         bridged = self.visible and bridge is not None and bridge.ready
         if self.visible and not bridged:
             display_cell(cell)

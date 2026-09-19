@@ -30,7 +30,7 @@
     "extension": true,
     "outputDir": "../data/share/jupyter/labextensions/codebind-jupyterlab",
     "_build": {
-      "load": "static/remoteEntry.c822f93a676f231b.js",
+      "load": "static/remoteEntry.5b982793e1ab1edd.js",
       "extension": "./extension"
     }
   }

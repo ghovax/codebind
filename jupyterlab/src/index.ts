@@ -2,7 +2,12 @@ import {
   JupyterFrontEnd,
   JupyterFrontEndPlugin
 } from '@jupyterlab/application';
-import { ICellModel, ICodeCellModel } from '@jupyterlab/cells';
+import {
+  CodeCell,
+  ICellModel,
+  ICodeCellModel,
+  MarkdownCell
+} from '@jupyterlab/cells';
 import * as nbformat from '@jupyterlab/nbformat';
 import {
   INotebookTracker,
@@ -27,11 +32,40 @@ interface MarkdownCellMessage {
 
 type CodebindMessage = CodeCellMessage | MarkdownCellMessage;
 
+interface InvocationStartedMessage {
+  type: 'invocation_started';
+  invocation_id: string;
+}
+
+interface ExecuteCellMessage {
+  type: 'execute_cell';
+  invocation_id: string;
+  request_id: string;
+  source: string;
+}
+
+interface InvocationCompletedMessage {
+  type: 'invocation_completed';
+  invocation_id: string;
+  source: string;
+}
+
+type InvocationMessage =
+  | InvocationStartedMessage
+  | ExecuteCellMessage
+  | InvocationCompletedMessage;
+
 interface TurnState {
   parentModel: ICodeCellModel | null;
   parentExecutionCount: number | null;
   resumeModel: ICellModel | null;
   nextIndex: number;
+}
+
+interface InvocationState {
+  id: string;
+  anchorModel: ICellModel;
+  lastModel: ICellModel;
 }
 
 function isCodebindMessage(value: unknown): value is CodebindMessage {
@@ -48,6 +82,32 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
     (typeof message.execution_count === 'number' ||
       message.execution_count === null) &&
     Array.isArray(message.outputs)
+  );
+}
+
+function isInvocationMessage(value: unknown): value is InvocationMessage {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const message = value as Record<string, unknown>;
+  if (
+    message.type === 'invocation_started' &&
+    typeof message.invocation_id === 'string'
+  ) {
+    return true;
+  }
+  if (
+    message.type === 'invocation_completed' &&
+    typeof message.invocation_id === 'string' &&
+    typeof message.source === 'string'
+  ) {
+    return true;
+  }
+  return (
+    message.type === 'execute_cell' &&
+    typeof message.invocation_id === 'string' &&
+    typeof message.request_id === 'string' &&
+    typeof message.source === 'string'
   );
 }
 
@@ -86,6 +146,155 @@ function insertCell(
   void notebook.scrollToItem(index);
 }
 
+function runningCellIndex(panel: NotebookPanel): number {
+  return panel.content.widgets.findIndex(
+    widget =>
+      widget.model.type === 'code' &&
+      (widget.model as ICodeCellModel).executionState === 'running'
+  );
+}
+
+function invocationInsertionIndex(
+  panel: NotebookPanel,
+  state: InvocationState,
+  states: InvocationState[]
+): number {
+  const widgets = panel.content.widgets;
+  let index = widgets.findIndex(widget => widget.model === state.lastModel) + 1;
+  for (const previous of states) {
+    if (previous === state) {
+      break;
+    }
+    if (previous.anchorModel === state.anchorModel) {
+      const previousIndex = widgets.findIndex(
+        widget => widget.model === previous.lastModel
+      );
+      index = Math.max(index, previousIndex + 1);
+    }
+  }
+  return Math.max(index, 0);
+}
+
+function startInvocation(
+  panel: NotebookPanel,
+  comm: Kernel.IComm,
+  message: InvocationStartedMessage,
+  invocations: Map<string, InvocationState>,
+  states: InvocationState[]
+): void {
+  const notebook = panel.content;
+  const parentIndex = runningCellIndex(panel);
+  const anchorCell =
+    (parentIndex >= 0 ? notebook.widgets[parentIndex] : null) ??
+    notebook.activeCell;
+  const anchor = anchorCell?.model;
+  if (!anchor) {
+    return;
+  }
+  const state = {
+    id: message.invocation_id,
+    anchorModel: anchor,
+    lastModel: anchor
+  };
+  invocations.set(message.invocation_id, state);
+  states.push(state);
+  const completed =
+    anchorCell instanceof CodeCell && anchorCell.outputArea.future
+      ? anchorCell.outputArea.future.done
+      : Promise.resolve();
+  void completed.then(() => {
+    comm.send({
+      type: 'invocation_ready',
+      invocation_id: message.invocation_id
+    });
+  });
+}
+
+async function executeInvocationCell(
+  panel: NotebookPanel,
+  comm: Kernel.IComm,
+  message: ExecuteCellMessage,
+  invocations: Map<string, InvocationState>,
+  states: InvocationState[]
+): Promise<void> {
+  const state = invocations.get(message.invocation_id);
+  const notebook = panel.content;
+  const model = notebook.model;
+  if (!state || !model) {
+    comm.send({
+      type: 'execution_result',
+      request_id: message.request_id,
+      error: 'invocation is not anchored to this notebook'
+    });
+    return;
+  }
+
+  const index = invocationInsertionIndex(panel, state, states);
+  model.sharedModel.insertCell(index, {
+    cell_type: 'code',
+    source: message.source,
+    metadata: { trusted: true },
+    execution_count: null,
+    outputs: []
+  });
+  await Promise.resolve();
+  const cell = notebook.widgets[index];
+  if (!(cell instanceof CodeCell)) {
+    comm.send({
+      type: 'execution_result',
+      request_id: message.request_id,
+      error: 'JupyterLab did not create a code cell'
+    });
+    return;
+  }
+  state.lastModel = cell.model;
+
+  try {
+    await CodeCell.execute(cell, panel.sessionContext, {
+      codebind_invocation_id: message.invocation_id
+    });
+    comm.send({
+      type: 'execution_result',
+      request_id: message.request_id,
+      execution_count: cell.model.executionCount,
+      outputs: JSON.parse(JSON.stringify(cell.model.outputs.toJSON()))
+    });
+  } catch (error) {
+    comm.send({
+      type: 'execution_result',
+      request_id: message.request_id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function completeInvocation(
+  panel: NotebookPanel,
+  message: InvocationCompletedMessage,
+  invocations: Map<string, InvocationState>,
+  states: InvocationState[]
+): Promise<void> {
+  const state = invocations.get(message.invocation_id);
+  const notebook = panel.content;
+  const model = notebook.model;
+  if (!state || !model || !message.source) {
+    return;
+  }
+
+  const index = invocationInsertionIndex(panel, state, states);
+  model.sharedModel.insertCell(index, {
+    cell_type: 'markdown',
+    source: message.source,
+    metadata: {}
+  });
+  await Promise.resolve();
+  const cell = notebook.widgets[index];
+  if (cell instanceof MarkdownCell) {
+    cell.rendered = true;
+    state.lastModel = cell.model;
+  }
+}
+
 function registerKernel(panel: NotebookPanel): void {
   const kernel = panel.sessionContext.session?.kernel;
   if (!kernel) {
@@ -93,6 +302,8 @@ function registerKernel(panel: NotebookPanel): void {
   }
 
   let turn: TurnState | null = null;
+  const invocations = new Map<string, InvocationState>();
+  const invocationStates: InvocationState[] = [];
 
   const finishTurn = (): void => {
     if (!turn) {
@@ -101,10 +312,7 @@ function registerKernel(panel: NotebookPanel): void {
     const notebook = panel.content;
     const completed = turn;
     turn = null;
-    if (
-      completed.parentModel &&
-      completed.parentExecutionCount !== null
-    ) {
+    if (completed.parentModel && completed.parentExecutionCount !== null) {
       completed.parentModel.executionCount = completed.parentExecutionCount;
     }
     if (completed.resumeModel) {
@@ -122,11 +330,7 @@ function registerKernel(panel: NotebookPanel): void {
       return turn;
     }
     const notebook = panel.content;
-    const parentIndex = notebook.widgets.findIndex(
-      widget =>
-        widget.model.type === 'code' &&
-        (widget.model as ICodeCellModel).executionState === 'running'
-    );
+    const parentIndex = runningCellIndex(panel);
     const parentModel =
       parentIndex >= 0
         ? (notebook.widgets[parentIndex].model as ICodeCellModel)
@@ -168,6 +372,29 @@ function registerKernel(panel: NotebookPanel): void {
           const activeTurn = beginTurn(data);
           insertCell(panel, data, activeTurn.nextIndex);
           activeTurn.nextIndex += 1;
+          return;
+        }
+        if (!isInvocationMessage(data)) {
+          return;
+        }
+        if (data.type === 'invocation_started') {
+          startInvocation(
+            panel,
+            comm,
+            data,
+            invocations,
+            invocationStates
+          );
+        } else if (data.type === 'execute_cell') {
+          void executeInvocationCell(
+            panel,
+            comm,
+            data,
+            invocations,
+            invocationStates
+          );
+        } else {
+          void completeInvocation(panel, data, invocations, invocationStates);
         }
       };
       comm.send({ type: 'ready' });

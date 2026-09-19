@@ -87,6 +87,7 @@ class Invocation:
         self._status: InvocationStatus = "pending"
         self._outcome: Outcome | None = None
         self._task: asyncio.Task[object] | None = None
+        self._before_wait: Callable[[], None] | None = None
         registry.register(self)
 
     @property
@@ -119,6 +120,8 @@ class Invocation:
         """Request cancellation of a running invocation."""
         if self._task is not None:
             self._task.cancel()
+        elif self._outcome is None:
+            self._finish(Outcome("cancelled"))
 
     def __await__(self) -> Generator[Any, None, Outcome]:
         return self._wait().__await__()
@@ -132,6 +135,10 @@ class Invocation:
     async def _wait(self) -> Outcome:
         if self._outcome is not None:
             return self._outcome
+        if self._task is None and self._before_wait is not None:
+            before_wait = self._before_wait
+            self._before_wait = None
+            before_wait()
         self.start()
         if self._task is None:
             raise RuntimeError("invocation could not start without an active event loop")
@@ -180,6 +187,9 @@ class Invocation:
             raise RuntimeError("invocation outcome is already set")
         self._outcome = outcome
         self._status = outcome.status
+
+    def _when_waited(self, callback: Callable[[], None]) -> None:
+        self._before_wait = callback
 
 
 class InvocationRegistry:

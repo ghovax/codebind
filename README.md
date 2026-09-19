@@ -40,10 +40,24 @@ Codebind does not load files or construct a project prompt automatically. The us
 `send()` and `asend()` run one visible agent invocation, including every repeated model and IPython step required to reach a final response. `invoke()` starts an independent invocation with its own history and returns an awaitable handle:
 
 ```python
-import asyncio
-
 first = chat.invoke("Review the API.", model)
 second = chat.invoke("Review the packaging.", model)
+(first, second)
+```
+
+In JupyterLab, leaving these handles unawaited releases the kernel immediately. Codebind then inserts and executes each requested IPython cell normally beneath the kick-off cell. Inspect, cancel, or fork the invocations from later cells:
+
+```python
+first.status
+first.history
+first.outcome
+first.cancel()
+```
+
+Awaiting in the launching cell keeps the existing blocking interaction:
+
+```python
+import asyncio
 
 first_outcome, second_outcome = await asyncio.gather(first, second)
 ```

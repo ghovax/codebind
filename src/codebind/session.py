@@ -15,7 +15,13 @@ from langchain_core.runnables import Runnable
 
 from .display import display_assistant
 from .execution import ExecutionReport, IPythonExecutor
-from .invocation import Invocation, InvocationRegistry, Outcome, message_text
+from .invocation import (
+    Invocation,
+    InvocationRegistry,
+    Outcome,
+    current_invocation_id,
+    message_text,
+)
 from .jupyter import JupyterLabBridge
 
 
@@ -56,6 +62,7 @@ class Session:
         bridge: JupyterLabBridge | None = None,
         _visible: bool = True,
         _registry: InvocationRegistry | None = None,
+        _invocation_id: str | None = None,
     ) -> None:
         resolved_shell = shell or get_ipython()
         if resolved_shell is None:
@@ -70,7 +77,9 @@ class Session:
             bridge,
             visible=_visible,
             registry=self._registry,
+            invocation_id=_invocation_id,
         )
+        self._invocation_id = _invocation_id
         self.instructions = instructions.strip() if instructions else None
         self.messages: list[BaseMessage] = []
         self.last_response: AIMessage | None = None
@@ -102,18 +111,44 @@ class Session:
         if not all(isinstance(message, BaseMessage) for message in starting_history):
             raise TypeError("history must contain only BaseMessage instances")
 
-        child = Session(
-            shell=self.shell,
-            bridge=None,
-            _visible=False,
-            _registry=self._registry,
+        bridge = self.bridge
+        notebook_invocation = (
+            current_invocation_id.get() is None
+            and bridge is not None
+            and bridge.ready
         )
-        child.messages.extend(starting_history)
+        child: Session
 
         async def run(new_history: list[BaseMessage]) -> AIMessage:
-            return await child._arun(text, model, new_history)
+            try:
+                return await child._arun(text, model, new_history)
+            except BaseException:
+                if notebook_invocation and bridge is not None:
+                    bridge.complete_invocation(invocation.id, "")
+                raise
 
-        return Invocation(text, starting_history, run, self._registry).start()
+        invocation = Invocation(text, starting_history, run, self._registry)
+        child = Session(
+            shell=self.shell,
+            bridge=bridge if notebook_invocation else None,
+            _visible=notebook_invocation,
+            _registry=self._registry,
+            _invocation_id=invocation.id if notebook_invocation else None,
+        )
+        child.messages.extend(starting_history)
+        if notebook_invocation and bridge is not None:
+            def start() -> None:
+                invocation.start()
+
+            def start_inline() -> None:
+                child._invocation_id = None
+                child.executor.invocation_id = None
+                invocation.start()
+
+            invocation._when_waited(start_inline)
+            bridge.start_invocation(invocation.id, start)
+            return invocation
+        return invocation.start()
 
     def send(self, prompt: str, model: BaseChatModel) -> None:
         """Run one visible agent invocation synchronously."""
@@ -217,7 +252,9 @@ class Session:
 
     def _finish_response(self, response: AIMessage) -> None:
         answer = message_text(response)
-        if answer and self._visible:
+        if self._invocation_id is not None and self.bridge is not None:
+            self.bridge.complete_invocation(self._invocation_id, answer)
+        elif answer and self._visible:
             self._display_assistant(answer)
 
     @staticmethod
