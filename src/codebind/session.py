@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -85,8 +86,15 @@ class Session:
         if self.instructions:
             self.messages.append(SystemMessage(self.instructions))
 
-    def send_sync(self, prompt: str, model: BaseChatModel) -> None:
-        """Send one user message from code without an active event loop."""
+    def send(self, prompt: str, model: BaseChatModel) -> None:
+        """Send one user message synchronously."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("send() cannot run inside an active event loop; use await asend().")
+
         text = prompt.strip()
         if not text:
             raise ValueError("prompt cannot be empty")
@@ -117,8 +125,8 @@ class Session:
                     )
                 )
 
-    async def send(self, prompt: str, model: BaseChatModel) -> None:
-        """Send one user message from an interactive IPython frontend."""
+    async def asend(self, prompt: str, model: BaseChatModel) -> None:
+        """Send one user message asynchronously."""
         text = prompt.strip()
         if not text:
             raise ValueError("prompt cannot be empty")
