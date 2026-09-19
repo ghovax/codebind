@@ -1,0 +1,5 @@
+{
+  "packageManager": "python",
+  "packageName": "codebind",
+  "uninstallInstructions": "Use the Python package manager that installed Codebind to uninstall it."
+}
