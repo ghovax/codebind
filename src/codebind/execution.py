@@ -8,9 +8,6 @@ from typing import Any
 from IPython.core.interactiveshell import InteractiveShell
 from IPython.utils.capture import capture_output
 
-from .prompts import CellPrompts
-
-
 @dataclass(frozen=True, slots=True)
 class ExecutionReport:
     """The model-facing result of one IPython cell."""
@@ -33,24 +30,19 @@ class IPythonExecutor:
     def __init__(self, shell: InteractiveShell) -> None:
         self.shell = shell
 
-    def execute(self, cell: str, *, prompts: CellPrompts | None = None) -> ExecutionReport:
+    def execute(self, cell: str) -> ExecutionReport:
         """Execute a cell, replay its visible output, and capture a structured result."""
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError("cell must be a non-empty string")
 
-        original_prompts = getattr(self.shell, "prompts", None)
         displayhook = self.shell.displayhook
         original_output_prompt = displayhook.write_output_prompt
-        if prompts is not None and original_prompts is not None:
-            self.shell.prompts = prompts
-            displayhook.write_output_prompt = lambda: None
+        displayhook.write_output_prompt = lambda: None
         try:
             with capture_output() as captured:
-                result = self.shell.run_cell(cell, store_history=False)
+                result = self.shell.run_cell(cell, store_history=True)
         finally:
-            if prompts is not None and original_prompts is not None:
-                self.shell.prompts = original_prompts
-                displayhook.write_output_prompt = original_output_prompt
+            displayhook.write_output_prompt = original_output_prompt
 
         displays: list[str] = []
         for output in captured.outputs:
