@@ -12,9 +12,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
 
+from .display import display_assistant
 from .execution import ExecutionReport, IPythonExecutor
-from .prompts import render_cell
-from .rendering import TerminalRenderer
 
 
 IPYTHON_TOOL = {
@@ -73,7 +72,6 @@ class Session:
 
         self.shell = resolved_shell
         self.executor = IPythonExecutor(resolved_shell)
-        self.renderer = TerminalRenderer()
         self.instructions = instructions.strip() if instructions else None
         self.messages: list[BaseMessage] = []
         self.last_response: AIMessage | None = None
@@ -106,11 +104,43 @@ class Session:
             if not response.tool_calls:
                 answer = _message_text(response)
                 if answer:
-                    self.renderer.assistant(answer)
+                    display_assistant(answer)
                 return
 
             for call in response.tool_calls:
                 report = self._execute_call(call)
+                identifier = str(call.get("id") or f"ipython-{len(self.messages)}")
+                self.messages.append(
+                    ToolMessage(
+                        json.dumps(report.as_dict(), ensure_ascii=False),
+                        tool_call_id=identifier,
+                    )
+                )
+
+    async def aask(self, prompt: str, model: BaseChatModel) -> None:
+        """Run one user turn asynchronously for notebook and event-loop frontends."""
+        text = prompt.strip()
+        if not text:
+            raise ValueError("prompt cannot be empty")
+
+        bound_model = self._bind(model)
+        self.messages.append(HumanMessage(text))
+
+        while True:
+            response = await bound_model.ainvoke(tuple(self.messages))
+            if not isinstance(response, AIMessage):
+                raise TypeError("model must return an AIMessage")
+            self.messages.append(response)
+            self.last_response = response
+
+            if not response.tool_calls:
+                answer = _message_text(response)
+                if answer:
+                    display_assistant(answer)
+                return
+
+            for call in response.tool_calls:
+                report = await self._aexecute_call(call)
                 identifier = str(call.get("id") or f"ipython-{len(self.messages)}")
                 self.messages.append(
                     ToolMessage(
@@ -133,11 +163,20 @@ class Session:
         if not isinstance(arguments, Mapping) or not isinstance(arguments.get("cell"), str):
             return _tool_error("InvalidArguments", "ipython requires a string cell argument")
 
-        cell = arguments["cell"]
-        render_cell(self.shell, cell)
         try:
-            report = self.executor.execute(cell)
+            report = self.executor.execute(arguments["cell"])
         except Exception as error:  # The failure must be returned to the model, not end the session.
             report = _tool_error(type(error).__name__, str(error))
-        self.renderer.tool_output(report, self.shell)
         return report
+
+    async def _aexecute_call(self, call: Mapping[str, Any]) -> ExecutionReport:
+        if call.get("name") != "ipython":
+            return _tool_error("UnknownTool", f"unknown tool: {call.get('name')!r}")
+        arguments = call.get("args")
+        if not isinstance(arguments, Mapping) or not isinstance(arguments.get("cell"), str):
+            return _tool_error("InvalidArguments", "ipython requires a string cell argument")
+
+        try:
+            return await self.executor.aexecute(arguments["cell"])
+        except Exception as error:
+            return _tool_error(type(error).__name__, str(error))

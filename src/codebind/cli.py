@@ -1,45 +1,17 @@
-"""Project-local IPython launcher with Codebind conveniences preloaded."""
+"""Standard IPython launcher with the Codebind extension loaded."""
 
 from __future__ import annotations
 
-import argparse
-from typing import Any
+import sys
 
-from IPython.core.interactiveshell import InteractiveShell
-from IPython.terminal.ipapp import TerminalIPythonApp
-from models_provider import Models
-from rich.console import Console
-from rich.markdown import Markdown
+from IPython import start_ipython
 
 from . import __version__
-from .session import Session
-
-
-BANNER = """\
-- `models = Models({...})`
-- `chat.ask("...", models.chat("provider/model"))`
-"""
-
-
-def namespace(shell: InteractiveShell) -> dict[str, Any]:
-    """Build the small namespace exposed by the Codebind shell."""
-    return {
-        "chat": Session(shell=shell),
-        "Models": Models,
-    }
 
 
 def main() -> None:
-    """Start IPython in the current directory with Codebind preloaded."""
-    parser = argparse.ArgumentParser(description="Start a model-enabled IPython session.")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.parse_args()
-
-    Console().print(Markdown(BANNER))
-    application = TerminalIPythonApp.instance()
-    application.display_banner = False
-    application.initialize([])
-    shell = application.shell
-    shell.enable_tip = False
-    shell.push(namespace(shell))
-    application.start()
+    """Start ordinary IPython with Codebind loaded as an extension."""
+    if sys.argv[1:] == ["--version"]:
+        print(f"codebind {__version__}")
+        return
+    start_ipython(argv=["--ext=codebind", *sys.argv[1:]])

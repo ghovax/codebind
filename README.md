@@ -1,6 +1,6 @@
 # Codebind
 
-Codebind runs a model with one tool: an IPython cell executed in the session shared with the user. Conversation history belongs to a `Session`; the model is selected independently for every call.
+Codebind is an IPython extension that runs a model with one tool: an IPython cell executed in the active session. IPython owns execution, namespace, history, magics, tracebacks, and rich display; Codebind owns only conversation and model orchestration.
 
 ## Installation
 
@@ -16,13 +16,13 @@ Or install it with any Python package installer:
 pip install codebind
 ```
 
-After installation, start the preconfigured shell from any directory:
+After installation, start ordinary IPython with the Codebind extension from any directory:
 
 ```console
 codebind
 ```
 
-It opens IPython with `chat` and `Models` already available and renders a short Markdown usage guide in the terminal. It does not modify the user's global IPython profile.
+It opens standard IPython with `chat` and `Models` in the user namespace. All normal IPython command-line options remain available.
 
 ```python
 models = Models({"openai": "OPENAI_API_KEY"})
@@ -34,6 +34,29 @@ chat.ask(
 ```
 
 Codebind does not load files or construct a project prompt automatically. The user states what should be loaded as context. Pass `instructions=` to `Session` only when an application needs its own system instructions.
+
+## Jupyter
+
+Install Codebind in the environment used by a Jupyter kernel, then start the Jupyter frontend normally:
+
+```console
+pip install codebind jupyterlab
+jupyter lab
+```
+
+Load Codebind in a notebook:
+
+```python
+%load_ext codebind
+
+models = Models({"openai": "OPENAI_API_KEY"})
+model = models.chat("openai/gpt-5")
+await chat.aask("Inspect the current notebook state.", model)
+```
+
+Codebind publishes cells, assistant Markdown, stdout, tracebacks, and rich results through IPython's MIME display system. The active frontend decides how to render HTML, Markdown, images, SVG, audio, tables, and plain text.
+
+Model-authored cells are recorded in native IPython history and displayed through the active frontend. A kernel cannot insert a genuine input cell into every possible frontend without a frontend-specific extension, so Codebind does not attempt to control notebook or editor UI.
 
 ## ChatGPT account login
 

@@ -3,6 +3,7 @@
 from importlib.metadata import version
 
 from .execution import ExecutionReport, IPythonExecutor
+from .extension import load_ipython_extension, unload_ipython_extension
 from .session import Session
 
 
@@ -13,4 +14,6 @@ __all__ = [
     "IPythonExecutor",
     "Session",
     "__version__",
+    "load_ipython_extension",
+    "unload_ipython_extension",
 ]
