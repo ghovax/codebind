@@ -1,4 +1,4 @@
-"""Conversation state and the single Python-tool model loop."""
+"""Conversation state and the single IPython-tool model loop."""
 
 from __future__ import annotations
 
@@ -13,26 +13,26 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
 
-from .execution import ExecutionReport, PythonExecutor
+from .execution import ExecutionReport, IPythonExecutor
 from .rendering import TerminalRenderer
 
 
-PYTHON_TOOL = {
+IPYTHON_TOOL = {
     "type": "function",
     "function": {
-        "name": "python",
+        "name": "ipython",
         "description": (
             "Execute an IPython cell in the state-persistent session shared with the user."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "script": {
+                "cell": {
                     "type": "string",
                     "description": "A complete IPython cell to execute.",
                 }
             },
-            "required": ["script"],
+            "required": ["cell"],
             "additionalProperties": False,
         },
     },
@@ -72,7 +72,7 @@ class Session:
             raise RuntimeError("Session must be created inside IPython or given an IPython shell.")
 
         self.shell = resolved_shell
-        self.executor = PythonExecutor(resolved_shell)
+        self.executor = IPythonExecutor(resolved_shell)
         self.renderer = TerminalRenderer()
         self.instructions = instructions.strip() if instructions else None
         self.messages: list[BaseMessage] = []
@@ -111,7 +111,7 @@ class Session:
 
             for call in response.tool_calls:
                 report = self._execute_call(call)
-                identifier = str(call.get("id") or f"python-{len(self.messages)}")
+                identifier = str(call.get("id") or f"ipython-{len(self.messages)}")
                 self.messages.append(
                     ToolMessage(
                         json.dumps(report.as_dict(), ensure_ascii=False),
@@ -122,28 +122,28 @@ class Session:
     @staticmethod
     def _bind(model: BaseChatModel) -> Runnable[Any, BaseMessage]:
         try:
-            return model.bind_tools([PYTHON_TOOL], parallel_tool_calls=False)
+            return model.bind_tools([IPYTHON_TOOL], parallel_tool_calls=False)
         except NotImplementedError:
-            return model.bind(tools=[PYTHON_TOOL], parallel_tool_calls=False)
+            return model.bind(tools=[IPYTHON_TOOL], parallel_tool_calls=False)
 
     def _execute_call(self, call: Mapping[str, Any]) -> ExecutionReport:
-        if call.get("name") != "python":
+        if call.get("name") != "ipython":
             return _tool_error("UnknownTool", f"unknown tool: {call.get('name')!r}")
         arguments = call.get("args")
-        if not isinstance(arguments, Mapping) or not isinstance(arguments.get("script"), str):
-            return _tool_error("InvalidArguments", "python requires a string script argument")
+        if not isinstance(arguments, Mapping) or not isinstance(arguments.get("cell"), str):
+            return _tool_error("InvalidArguments", "ipython requires a string cell argument")
 
-        script = arguments["script"]
-        self._show_call(script)
+        cell = arguments["cell"]
+        self._show_call(cell)
         try:
-            report = self.executor.execute(script)
+            report = self.executor.execute(cell)
         except Exception as error:  # The failure must be returned to the model, not end the session.
             report = _tool_error(type(error).__name__, str(error))
         self.renderer.tool_output(report)
         return report
 
-    def _show_call(self, script: str) -> None:
-        highlighted = self.shell.pycolorize(script.rstrip())
+    def _show_call(self, cell: str) -> None:
+        highlighted = self.shell.pycolorize(cell.rstrip())
         sys.stdout.write("\n")
         sys.stdout.write(highlighted)
         if not highlighted.endswith("\n"):

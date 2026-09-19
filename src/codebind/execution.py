@@ -1,4 +1,4 @@
-"""Execution of model-authored Python in a shared IPython namespace."""
+"""Execution of model-authored cells in a shared IPython namespace."""
 
 from __future__ import annotations
 
@@ -25,23 +25,23 @@ class ExecutionReport:
         return asdict(self)
 
 
-class PythonExecutor:
+class IPythonExecutor:
     """Run cells through one existing IPython shell."""
 
     def __init__(self, shell: InteractiveShell) -> None:
         self.shell = shell
 
-    def execute(self, script: str) -> ExecutionReport:
+    def execute(self, cell: str) -> ExecutionReport:
         """Execute a cell, replay its visible output, and capture a structured result."""
-        if not isinstance(script, str) or not script.strip():
-            raise ValueError("script must be a non-empty string")
+        if not isinstance(cell, str) or not cell.strip():
+            raise ValueError("cell must be a non-empty string")
 
         displayhook = self.shell.displayhook
         original_prompt = displayhook.write_output_prompt
         displayhook.write_output_prompt = lambda: None
         try:
             with capture_output() as captured:
-                result = self.shell.run_cell(script, store_history=False)
+                result = self.shell.run_cell(cell, store_history=False)
         finally:
             displayhook.write_output_prompt = original_prompt
 
