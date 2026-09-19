@@ -307,7 +307,7 @@ wheels = [
 
 [[package]]
 name = "codebind"
-version = "0.4.1"
+version = "0.4.2"
 source = { editable = "." }
 dependencies = [
     { name = "ipython" },
@@ -325,7 +325,7 @@ dev = [
 requires-dist = [
     { name = "ipython", specifier = ">=9.0" },
     { name = "langchain-core", specifier = ">=1.0" },
-    { name = "models-provider", specifier = ">=0.1.0" },
+    { name = "models-provider", specifier = ">=0.1.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -977,7 +977,7 @@ wheels = [
 
 [[package]]
 name = "models-provider"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -986,9 +986,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/82/5f9592afe4b2b8929f7be83a9664f0539d173aac7de49aac689d9e474a31/models_provider-0.1.0.tar.gz", hash = "sha256:e63225e4533da3df76ca5de79caad5ef1ff5f79850a6b0922c849143c4aa24d2", size = 34618, upload-time = "2026-09-19T01:58:23.06Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/1f/448897a281d8db4741e454c08bf22ff9f7674c5b252aad70f1ef8d98ef9e/models_provider-0.1.1.tar.gz", hash = "sha256:4ef5b03b9fded01f098e0a677ee59e5020a999f52a2b5e3d35461422e44dc2c0", size = 36093, upload-time = "2026-09-19T15:35:51.428Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/60/70/518c29859b2697d0de7ab0c227e528fdcf9cf29b2e96059c8ad83e985787/models_provider-0.1.0-py3-none-any.whl", hash = "sha256:4552e2c437168d3f58802a87fbe110491c81ab78e37969e581d4da6c62fc6305", size = 40897, upload-time = "2026-09-19T01:58:21.873Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/b1/738e7bf09010dd348bad26b220b24918a42728453bb2a5f3a424c6293055/models_provider-0.1.1-py3-none-any.whl", hash = "sha256:be2eb97572852d85bc24dad528b90962418155379ddf5e3bcbda515f712cf9fd", size = 42308, upload-time = "2026-09-19T15:35:50.25Z" },
 ]
 
 [[package]]

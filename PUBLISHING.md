@@ -16,7 +16,7 @@ Create the `pypi` environment in the GitHub repository. No long-lived PyPI token
 
 ## Release
 
-After `models-provider>=0.1.0` is available from PyPI, verify registry-only resolution and release from a clean `main` checkout:
+After the required Models Provider release is available from PyPI, verify registry-only resolution and release from a clean `main` checkout:
 
 ```console
 uv version 0.1.0
