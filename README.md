@@ -22,11 +22,9 @@ After installation, start ordinary IPython with the Codebind extension from any 
 codebind
 ```
 
-It opens standard IPython with `chat` and `Models` in the user namespace. All normal IPython command-line options remain available.
+It opens standard IPython with `chat`, `models`, and `Models` in the user namespace. `models` loads provider values from `$XDG_CONFIG_HOME/codebind/models.json`, or `~/.config/codebind/models.json` when `XDG_CONFIG_HOME` is unset. Keep that credential file readable only by its owner. All normal IPython command-line options remain available.
 
 ```python
-models = Models({"openai": "OPENAI_API_KEY"})
-
 chat.send(
     "Inspect this project and tell me what to implement first.",
     models.chat("openai/gpt-5", reasoning_effort="medium"),
@@ -40,7 +38,7 @@ Codebind does not load files or construct a project prompt automatically. The us
 Start JupyterLab with Codebind from any directory without a permanent installation:
 
 ```console
-uvx --from jupyterlab --with codebind jupyter lab
+uvx --from jupyterlab --with codebind --with 'nbconvert[webpdf]' jupyter lab
 ```
 
 Or install both packages into the same environment, then start JupyterLab normally:
@@ -59,7 +57,6 @@ Load Codebind in a notebook:
 Run that cell once so JupyterLab can connect to the extension, then use Codebind in later cells:
 
 ```python
-models = Models({"openai": "OPENAI_API_KEY"})
 model = models.chat("openai/gpt-5")
 await chat.asend("Inspect the current notebook state.", model)
 ```
@@ -86,6 +83,6 @@ chat.send(
 )
 ```
 
-The authorization remains in memory for this session. Persistent credential storage belongs to the host application.
+The authorization remains in memory for this session. Save provider values as a JSON object in Codebind's XDG configuration file and reload the extension to expose them through `models`.
 
 OpenAI officially supports ChatGPT subscription sign-in for Codex clients. Models Provider reproduces that account-access boundary for this library; it is separate from the public, pay-as-you-go OpenAI API and may require compatibility updates when the Codex account protocol changes.
