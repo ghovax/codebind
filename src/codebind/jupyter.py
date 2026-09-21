@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -9,6 +11,7 @@ from IPython.core.interactiveshell import InteractiveShell
 
 
 _TARGET_NAME = "codebind"
+_QuestionHandler = Callable[[str, str], Awaitable[None]]
 
 
 class JupyterLabBridge:
@@ -16,6 +19,8 @@ class JupyterLabBridge:
 
     def __init__(self, comm: Any) -> None:
         self._comm = comm
+        self._question_handler: _QuestionHandler | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
         self.ready = False
         comm.on_msg(self._on_message)
 
@@ -34,8 +39,15 @@ class JupyterLabBridge:
 
     def close(self) -> None:
         """Close the frontend connection."""
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
         self._comm.close()
         self.ready = False
+
+    def handle_questions(self, handler: _QuestionHandler) -> None:
+        """Handle questions submitted by Codebind cells."""
+        self._question_handler = handler
 
     def start_code_cell(self, source: str) -> str | None:
         """Insert a running code cell before its execution begins."""
@@ -105,5 +117,34 @@ class JupyterLabBridge:
 
     def _on_message(self, message: dict[str, Any]) -> None:
         data = message.get("content", {}).get("data", {})
-        if isinstance(data, dict) and data.get("type") == "ready":
+        if not isinstance(data, dict):
+            return
+        if data.get("type") == "ready":
             self.ready = True
+            return
+        if data.get("type") != "question":
+            return
+        cell_id = data.get("cell_id")
+        question = data.get("question")
+        model = data.get("model", "model")
+        if not all(isinstance(value, str) for value in (cell_id, question, model)):
+            return
+        task = asyncio.create_task(self._answer_question(cell_id, question, model))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _answer_question(self, cell_id: str, question: str, model: str) -> None:
+        error: dict[str, str] | None = None
+        try:
+            if self._question_handler is None:
+                raise RuntimeError("Codebind is not ready to receive questions.")
+            await self._question_handler(question, model)
+        except Exception as exception:
+            error = {"type": type(exception).__name__, "message": str(exception)}
+        self._comm.send(
+            {
+                "type": "question_finished",
+                "cell_id": cell_id,
+                "error": error,
+            }
+        )

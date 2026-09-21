@@ -61,6 +61,8 @@ model = models.chat("openai/gpt-5")
 await chat.asend("Inspect the current notebook state.", model)
 ```
 
+After assigning `model`, click **Question** in the notebook toolbar to insert a Question cell. Write ordinary Markdown and press `Shift+Enter`; Codebind sends the cell through `chat` using the `model` variable, renders the question as Markdown, and inserts tool executions and the assistant response beneath it. Question cells are stored as standard Markdown cells with Codebind metadata, so other notebook frontends can still read them.
+
 The Codebind package includes a prebuilt JupyterLab extension. In JupyterLab, each model-authored IPython execution becomes a genuine code cell with its native execution count and outputs, and the assistant response becomes a rendered Markdown cell. The cells are ordinary notebook content and are saved with the notebook.
 
 Other IPython frontends use the standard MIME display protocol instead. They still receive syntax-highlighted code, assistant Markdown, stdout, tracebacks, rich results, and native IPython history without Codebind depending on their UI.

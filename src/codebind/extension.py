@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from IPython.core.interactiveshell import InteractiveShell
+from langchain_core.language_models import BaseChatModel
 from models_provider import Models
 
 from .jupyter import JupyterLabBridge
@@ -46,8 +47,18 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             previous_chat.bridge.close()
         ipython.drop_by_id(previous)
     bridge = JupyterLabBridge.connect(ipython)
+    chat = Session(shell=ipython, bridge=bridge)
+    if bridge is not None:
+
+        async def answer_question(question: str, model_name: str) -> None:
+            model = ipython.user_ns.get(model_name)
+            if not isinstance(model, BaseChatModel):
+                raise NameError(f"{model_name!r} is not a chat model in the IPython namespace")
+            await chat.asend(question, model)
+
+        bridge.handle_questions(answer_question)
     namespace: dict[str, Any] = {
-        "chat": Session(shell=ipython, bridge=bridge),
+        "chat": chat,
         "Models": Models,
         "models": models,
     }

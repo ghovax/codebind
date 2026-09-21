@@ -426,7 +426,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@jupyterlab/apputils@npm:^4.7.3":
+"@jupyterlab/apputils@npm:^4.0.0, @jupyterlab/apputils@npm:^4.7.3":
   version: 4.7.3
   resolution: "@jupyterlab/apputils@npm:4.7.3"
   dependencies:
@@ -2024,6 +2024,7 @@ __metadata:
   dependencies:
     "@jupyter/builder": ^1.2.0
     "@jupyterlab/application": ^4.0.0
+    "@jupyterlab/apputils": ^4.0.0
     "@jupyterlab/cells": ^4.0.0
     "@jupyterlab/nbformat": ^4.0.0
     "@jupyterlab/notebook": ^4.0.0
