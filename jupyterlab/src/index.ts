@@ -48,6 +48,20 @@ interface MarkdownCellMessage {
   source: string;
 }
 
+interface MarkdownCellStreamMessage {
+  type:
+    | 'markdown_cell_started'
+    | 'markdown_cell_updated'
+    | 'markdown_cell_finished';
+  cell_id: string;
+  source: string;
+}
+
+interface MarkdownCellCancelledMessage {
+  type: 'markdown_cell_cancelled';
+  cell_id: string;
+}
+
 interface InstructionsCellMessage {
   type: 'instructions_cell';
   source: string;
@@ -82,6 +96,8 @@ type CodebindMessage =
   | CodeCellOutputMessage
   | CodeCellClearMessage
   | MarkdownCellMessage
+  | MarkdownCellStreamMessage
+  | MarkdownCellCancelledMessage
   | InstructionsCellMessage
   | QuestionStartedMessage
   | QuestionFinishedMessage
@@ -150,6 +166,18 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
     message.type === 'instructions_cell'
   ) {
     return typeof message.source === 'string';
+  }
+  if (
+    message.type === 'markdown_cell_started' ||
+    message.type === 'markdown_cell_updated' ||
+    message.type === 'markdown_cell_finished'
+  ) {
+    return (
+      typeof message.cell_id === 'string' && typeof message.source === 'string'
+    );
+  }
+  if (message.type === 'markdown_cell_cancelled') {
+    return typeof message.cell_id === 'string';
   }
   if (message.type === 'code_cell_started') {
     return (
@@ -499,6 +527,7 @@ function registerKernel(panel: NotebookPanel): void {
 
   let turn: TurnState | null = null;
   const codeCells = new Map<string, ICodeCellModel>();
+  const markdownCells = new Map<string, ICellModel>();
 
   const finishTurn = (): void => {
     if (!turn) {
@@ -623,6 +652,35 @@ function registerKernel(panel: NotebookPanel): void {
           }
           return;
         }
+        if (data.type === 'markdown_cell_updated' || data.type === 'markdown_cell_finished') {
+          const model = markdownCells.get(data.cell_id);
+          if (!model) {
+            return;
+          }
+          model.sharedModel.setSource(normalizeMathDelimiters(data.source));
+          const cell = panel.content.widgets.find(widget => widget.model.id === model.id);
+          if (cell instanceof MarkdownCell) {
+            cell.rendered = true;
+          }
+          if (data.type === 'markdown_cell_finished') {
+            markdownCells.delete(data.cell_id);
+          }
+          return;
+        }
+        if (data.type === 'markdown_cell_cancelled') {
+          const model = markdownCells.get(data.cell_id);
+          markdownCells.delete(data.cell_id);
+          if (!model) {
+            return;
+          }
+          const index = panel.content.widgets.findIndex(
+            widget => widget.model.id === model.id
+          );
+          if (index >= 0) {
+            panel.content.model?.sharedModel.deleteCell(index);
+          }
+          return;
+        }
         if (data.type === 'code_cell_output') {
           codeCells.get(data.cell_id)?.outputs.add(data.output);
           return;
@@ -649,12 +707,26 @@ function registerKernel(panel: NotebookPanel): void {
           return;
         }
 
+        let inserted: InsertMessage;
+        if (data.type === 'markdown_cell_started') {
+          inserted = { type: 'markdown_cell', source: data.source };
+        } else if (
+          data.type === 'markdown_cell' ||
+          data.type === 'code_cell_started'
+        ) {
+          inserted = data;
+        } else {
+          return;
+        }
         beginTurn();
-        const model = insertCell(panel, data);
+        const model = insertCell(panel, inserted);
         if (data.type === 'code_cell_started' && model?.type === 'code') {
           const code = model as ICodeCellModel;
           code.executionState = 'running';
           codeCells.set(data.cell_id, code);
+        }
+        if (data.type === 'markdown_cell_started' && model) {
+          markdownCells.set(data.cell_id, model);
         }
       };
       panelState.comm = comm;

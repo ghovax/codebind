@@ -1,6 +1,6 @@
 {
   "name": "codebind-jupyterlab",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Native JupyterLab cells and Question cells for Codebind.",
   "license": "MIT",
   "main": "lib/index.js",
@@ -31,7 +31,7 @@
     "extension": true,
     "outputDir": "../data/share/jupyter/labextensions/codebind-jupyterlab",
     "_build": {
-      "load": "static/remoteEntry.4f0137dd98629dab.js",
+      "load": "static/remoteEntry.b171b12ff4a78939.js",
       "extension": "./extension"
     }
   }

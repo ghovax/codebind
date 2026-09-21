@@ -1,6 +1,6 @@
 {
   "name": "codebind-jupyterlab",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Native JupyterLab cells and Question cells for Codebind.",
   "license": "MIT",
   "main": "lib/index.js",

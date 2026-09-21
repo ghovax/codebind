@@ -14,12 +14,15 @@ from IPython.core.interactiveshell import InteractiveShell
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    message_chunk_to_message,
     messages_from_dict,
 )
+from langchain_core.messages.ai import add_ai_message_chunks
 from langchain_core.runnables import Runnable
 
 from .display import display_assistant
@@ -56,7 +59,7 @@ IPYTHON_TOOL = {
 }
 
 
-def _message_text(message: AIMessage) -> str:
+def _message_text(message: BaseMessage) -> str:
     content = message.content
     if isinstance(content, str):
         return content
@@ -242,6 +245,103 @@ class Session:
         for identifier in identifiers:
             self._append_message_sync(self._interrupted_tool_message(identifier), turn_id)
 
+    def _update_assistant_stream(self, cell_id: str | None, text: str) -> str | None:
+        if self.bridge is None or not text:
+            return cell_id
+        if cell_id is None:
+            return self.bridge.start_markdown_cell(text)
+        self.bridge.update_markdown_cell(cell_id, text)
+        return cell_id
+
+    def _finish_assistant_stream(self, cell_id: str | None, response: AIMessage) -> None:
+        answer = _message_text(response)
+        if cell_id is not None and self.bridge is not None:
+            self.bridge.finish_markdown_cell(cell_id, answer)
+        elif answer:
+            self._display_assistant(answer)
+
+    def _cancel_assistant_stream(self, cell_id: str | None) -> None:
+        if cell_id is not None and self.bridge is not None:
+            self.bridge.cancel_markdown_cell(cell_id)
+
+    @staticmethod
+    def _completed_stream_message(
+        chunk: AIMessageChunk | None,
+        response: AIMessage | None,
+    ) -> AIMessage:
+        if response is not None:
+            return response
+        if chunk is None:
+            raise RuntimeError("model stream returned no messages")
+        message = message_chunk_to_message(chunk)
+        if not isinstance(message, AIMessage):
+            raise TypeError("model stream must return an AIMessage")
+        return message
+
+    def _stream_model(
+        self,
+        bound_model: Runnable[Any, BaseMessage],
+        model: BaseChatModel,
+    ) -> tuple[AIMessage, str | None]:
+        aggregate: AIMessageChunk | None = None
+        response: AIMessage | None = None
+        cell_id: str | None = None
+        shown = ""
+        try:
+            for message in bound_model.stream(self.messages, **self._model_kwargs(model)):
+                if isinstance(message, AIMessageChunk):
+                    aggregate = (
+                        message
+                        if aggregate is None
+                        else add_ai_message_chunks(aggregate, message)
+                    )
+                    current = message_chunk_to_message(aggregate)
+                elif isinstance(message, AIMessage) and aggregate is None and response is None:
+                    response = message
+                    current = message
+                else:
+                    raise TypeError("model stream must return AIMessage chunks")
+                text = _message_text(current)
+                if text != shown:
+                    cell_id = self._update_assistant_stream(cell_id, text)
+                    shown = text
+            return self._completed_stream_message(aggregate, response), cell_id
+        except BaseException:
+            self._cancel_assistant_stream(cell_id)
+            raise
+
+    async def _astream_model(
+        self,
+        bound_model: Runnable[Any, BaseMessage],
+        model: BaseChatModel,
+    ) -> tuple[AIMessage, str | None]:
+        aggregate: AIMessageChunk | None = None
+        response: AIMessage | None = None
+        cell_id: str | None = None
+        shown = ""
+        try:
+            async for message in bound_model.astream(self.messages, **self._model_kwargs(model)):
+                if isinstance(message, AIMessageChunk):
+                    aggregate = (
+                        message
+                        if aggregate is None
+                        else add_ai_message_chunks(aggregate, message)
+                    )
+                    current = message_chunk_to_message(aggregate)
+                elif isinstance(message, AIMessage) and aggregate is None and response is None:
+                    response = message
+                    current = message
+                else:
+                    raise TypeError("model stream must return AIMessage chunks")
+                text = _message_text(current)
+                if text != shown:
+                    cell_id = self._update_assistant_stream(cell_id, text)
+                    shown = text
+            return self._completed_stream_message(aggregate, response), cell_id
+        except BaseException:
+            self._cancel_assistant_stream(cell_id)
+            raise
+
     def clear(self) -> None:
         """Clear conversation history without clearing the shared Python namespace."""
         try:
@@ -283,20 +383,17 @@ class Session:
         self._append_event_sync("turn_started", turn_id=turn_id)
         bound_model = self._bind(model)
         pending_calls: list[str] = []
+        assistant_cell_id: str | None = None
         try:
             self._append_notebook_sync(notebook, turn_id)
             self._append_message_sync(HumanMessage(text), turn_id)
             while True:
-                response = bound_model.invoke(self.messages, **self._model_kwargs(model))
-                if not isinstance(response, AIMessage):
-                    raise TypeError("model must return an AIMessage")
+                response, assistant_cell_id = self._stream_model(bound_model, model)
                 pending_calls = self._ensure_tool_call_ids(response)
                 self._append_message_sync(response, turn_id)
                 self.last_response = response
-
-                answer = _message_text(response)
-                if answer:
-                    self._display_assistant(answer)
+                self._finish_assistant_stream(assistant_cell_id, response)
+                assistant_cell_id = None
                 if not response.tool_calls:
                     self._append_event_sync("turn_finished", turn_id=turn_id, status="completed")
                     return
@@ -312,10 +409,12 @@ class Session:
                     )
                     pending_calls.remove(identifier)
         except KeyboardInterrupt:
+            self._cancel_assistant_stream(assistant_cell_id)
             self._seal_interrupted_calls_sync(pending_calls, turn_id)
             self._append_event_sync("turn_finished", turn_id=turn_id, status="cancelled")
             raise
         except Exception:
+            self._cancel_assistant_stream(assistant_cell_id)
             self._seal_interrupted_calls_sync(pending_calls, turn_id)
             self._append_event_sync("turn_finished", turn_id=turn_id, status="failed")
             raise
@@ -337,23 +436,17 @@ class Session:
         await self._append_event("turn_started", turn_id=turn_id)
         bound_model = self._bind(model)
         pending_calls: list[str] = []
+        assistant_cell_id: str | None = None
         try:
             await self._append_notebook(notebook, turn_id)
             await self._append_message(HumanMessage(text), turn_id)
             while True:
-                response = await bound_model.ainvoke(
-                    self.messages,
-                    **self._model_kwargs(model),
-                )
-                if not isinstance(response, AIMessage):
-                    raise TypeError("model must return an AIMessage")
+                response, assistant_cell_id = await self._astream_model(bound_model, model)
                 pending_calls = self._ensure_tool_call_ids(response)
                 await self._append_message(response, turn_id)
                 self.last_response = response
-
-                answer = _message_text(response)
-                if answer:
-                    self._display_assistant(answer)
+                self._finish_assistant_stream(assistant_cell_id, response)
+                assistant_cell_id = None
                 if not response.tool_calls:
                     await self._append_event("turn_finished", turn_id=turn_id, status="completed")
                     return
@@ -369,12 +462,14 @@ class Session:
                     )
                     pending_calls.remove(identifier)
         except asyncio.CancelledError:
+            self._cancel_assistant_stream(assistant_cell_id)
             await asyncio.shield(self._seal_interrupted_calls(pending_calls, turn_id))
             await asyncio.shield(
                 self._append_event("turn_finished", turn_id=turn_id, status="cancelled")
             )
             raise
         except Exception:
+            self._cancel_assistant_stream(assistant_cell_id)
             await self._seal_interrupted_calls(pending_calls, turn_id)
             await self._append_event("turn_finished", turn_id=turn_id, status="failed")
             raise

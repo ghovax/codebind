@@ -153,6 +153,53 @@ class JupyterLabBridge:
         self._comm.send({"type": "markdown_cell", "source": source})
         return True
 
+    def start_markdown_cell(self, source: str) -> str | None:
+        """Insert a Markdown cell as soon as assistant text starts streaming."""
+        if not self.ready:
+            return None
+        cell_id = str(uuid4())
+        self._comm.send(
+            {
+                "type": "markdown_cell_started",
+                "cell_id": cell_id,
+                "source": source,
+            }
+        )
+        return cell_id
+
+    def update_markdown_cell(self, cell_id: str, source: str) -> bool:
+        """Replace the source of a streaming assistant Markdown cell."""
+        if not self.ready:
+            return False
+        self._comm.send(
+            {
+                "type": "markdown_cell_updated",
+                "cell_id": cell_id,
+                "source": source,
+            }
+        )
+        return True
+
+    def finish_markdown_cell(self, cell_id: str, source: str) -> bool:
+        """Finalize a streaming assistant Markdown cell."""
+        if not self.ready:
+            return False
+        self._comm.send(
+            {
+                "type": "markdown_cell_finished",
+                "cell_id": cell_id,
+                "source": source,
+            }
+        )
+        return True
+
+    def cancel_markdown_cell(self, cell_id: str) -> bool:
+        """Remove assistant Markdown from an interrupted model response."""
+        if not self.ready:
+            return False
+        self._comm.send({"type": "markdown_cell_cancelled", "cell_id": cell_id})
+        return True
+
     def ensure_instructions_cell(self, source: str) -> bool:
         """Show the conversation's immutable system instructions in the notebook."""
         if not self.ready:
