@@ -65,8 +65,6 @@ type InsertMessage = CodeCellStartedMessage | MarkdownCellMessage;
 interface TurnState {
   parentModel: ICodeCellModel | null;
   parentExecutionCount: number | null;
-  resumeModel: ICellModel | null;
-  nextIndex: number;
 }
 
 interface PanelState {
@@ -162,8 +160,7 @@ function refreshQuestionCells(panel: NotebookPanel): void {
 
 function insertCell(
   panel: NotebookPanel,
-  message: InsertMessage,
-  index: number
+  message: InsertMessage
 ): ICellModel | null {
   const notebook = panel.content;
   const model = notebook.model;
@@ -171,6 +168,7 @@ function insertCell(
     return null;
   }
 
+  const index = notebook.widgets.length;
   if (message.type === 'code_cell_started') {
     model.sharedModel.insertCell(index, {
       cell_type: 'code',
@@ -187,13 +185,11 @@ function insertCell(
     });
   }
 
-  notebook.activeCellIndex = index;
-  notebook.deselectAll();
-  if (message.type === 'markdown_cell') {
-    void NotebookActions.run(notebook);
+  const cell = notebook.widgets[index] ?? null;
+  if (cell instanceof MarkdownCell) {
+    cell.rendered = true;
   }
-  void notebook.scrollToItem(index);
-  return notebook.widgets[index]?.model ?? null;
+  return cell?.model ?? null;
 }
 
 function registerKernel(panel: NotebookPanel): void {
@@ -213,11 +209,10 @@ function registerKernel(panel: NotebookPanel): void {
   let turn: TurnState | null = null;
   const codeCells = new Map<string, ICodeCellModel>();
 
-  const finishTurn = (restoreSelection = true): void => {
+  const finishTurn = (): void => {
     if (!turn) {
       return;
     }
-    const notebook = panel.content;
     const completed = turn;
     turn = null;
     if (
@@ -225,14 +220,6 @@ function registerKernel(panel: NotebookPanel): void {
       completed.parentExecutionCount !== null
     ) {
       completed.parentModel.executionCount = completed.parentExecutionCount;
-    }
-    if (restoreSelection && completed.resumeModel) {
-      const index = notebook.widgets.findIndex(
-        widget => widget.model === completed.resumeModel
-      );
-      if (index >= 0) {
-        notebook.activeCellIndex = index;
-      }
     }
   };
 
@@ -252,14 +239,7 @@ function registerKernel(panel: NotebookPanel): void {
         : null;
     turn = {
       parentModel,
-      parentExecutionCount: null,
-      resumeModel: notebook.activeCell?.model ?? null,
-      nextIndex:
-        parentIndex >= 0
-          ? parentIndex + 1
-          : notebook.activeCell
-            ? notebook.activeCellIndex + 1
-            : 0
+      parentExecutionCount: null
     };
 
     const onStatus = (
@@ -286,7 +266,7 @@ function registerKernel(panel: NotebookPanel): void {
         if (data.type === 'question_finished') {
           panelState.runningQuestions.delete(data.cell_id);
           refreshQuestionCells(panel);
-          finishTurn(false);
+          finishTurn();
           if (data.error) {
             void showErrorMessage(
               `Codebind question: ${data.error.type}`,
@@ -321,14 +301,13 @@ function registerKernel(panel: NotebookPanel): void {
           return;
         }
 
-        const activeTurn = beginTurn();
-        const model = insertCell(panel, data, activeTurn.nextIndex);
+        beginTurn();
+        const model = insertCell(panel, data);
         if (data.type === 'code_cell_started' && model?.type === 'code') {
           const code = model as ICodeCellModel;
           code.executionState = 'running';
           codeCells.set(data.cell_id, code);
         }
-        activeTurn.nextIndex += 1;
       };
       panelState.comm = comm;
       comm.onClose = () => {
@@ -341,23 +320,24 @@ function registerKernel(panel: NotebookPanel): void {
   );
 }
 
-function insertQuestion(panel: NotebookPanel): void {
+function configureQuestion(panel: NotebookPanel): void {
   const notebook = panel.content;
   const model = notebook.model;
   if (!model) {
     return;
   }
-  const index = notebook.activeCell ? notebook.activeCellIndex + 1 : 0;
-  model.sharedModel.insertCell(index, {
-    cell_type: 'markdown',
-    source: '',
-    metadata: {
-      codebind: { kind: 'question', model: 'model' }
-    }
-  });
-  notebook.activeCellIndex = index;
-  notebook.deselectAll();
-  const cell = notebook.widgets[index];
+  if (!notebook.activeCell) {
+    model.sharedModel.insertCell(0, {
+      cell_type: 'markdown',
+      source: '',
+      metadata: {}
+    });
+    notebook.activeCellIndex = 0;
+  } else if (notebook.activeCell.model.type !== 'markdown') {
+    NotebookActions.changeCellType(notebook, 'markdown');
+  }
+  const cell = notebook.activeCell;
+  cell?.model.setMetadata('codebind', { kind: 'question', model: 'model' });
   if (cell instanceof MarkdownCell) {
     cell.rendered = false;
   }
@@ -420,7 +400,7 @@ function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
     'codebindQuestion',
     new ToolbarButton({
       label: 'Question',
-      tooltip: 'Insert a Codebind Question cell',
+      tooltip: 'Use the selected cell as a Codebind Question',
       onClick: () => {
         void app.commands.execute(INSERT_QUESTION);
       }
@@ -439,11 +419,11 @@ const plugin: JupyterFrontEndPlugin<void> = {
   requires: [INotebookTracker],
   activate: (app: JupyterFrontEnd, tracker: INotebookTracker): void => {
     app.commands.addCommand(INSERT_QUESTION, {
-      label: 'Insert Codebind Question',
+      label: 'Use Selected Cell as Codebind Question',
       execute: () => {
         const panel = tracker.currentWidget;
         if (panel) {
-          insertQuestion(panel);
+          configureQuestion(panel);
         }
       }
     });
