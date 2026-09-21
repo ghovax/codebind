@@ -51,6 +51,7 @@ interface QuestionFinishedMessage {
   type: 'question_finished';
   cell_id: string;
   error: { type: string; message: string } | null;
+  cancelled: boolean;
 }
 
 type CodebindMessage =
@@ -69,6 +70,7 @@ interface TurnState {
 
 interface PanelState {
   comm: Kernel.IComm | null;
+  kernel: Kernel.IKernelConnection | null;
   runningQuestions: Map<string, ICellModel>;
 }
 
@@ -78,6 +80,18 @@ interface QuestionMetadata {
 }
 
 const panelStates = new WeakMap<NotebookPanel, PanelState>();
+const kernelStates = new WeakMap<
+  Kernel.IKernelConnection,
+  Set<PanelState>
+>();
+
+function cancelQuestions(state: PanelState): boolean {
+  if (state.runningQuestions.size === 0) {
+    return false;
+  }
+  state.comm?.send({ type: 'cancel' });
+  return true;
+}
 
 function isCodebindMessage(value: unknown): value is CodebindMessage {
   if (typeof value !== 'object' || value === null) {
@@ -107,6 +121,7 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
     const error = message.error;
     return (
       typeof message.cell_id === 'string' &&
+      typeof message.cancelled === 'boolean' &&
       (error === null ||
         (typeof error === 'object' &&
           typeof (error as Record<string, unknown>).type === 'string' &&
@@ -120,6 +135,38 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
       message.execution_count === null) &&
     Array.isArray(message.outputs)
   );
+}
+
+function connectInterrupt(
+  kernel: Kernel.IKernelConnection,
+  state: PanelState
+): void {
+  if (state.kernel && state.kernel !== kernel) {
+    kernelStates.get(state.kernel)?.delete(state);
+  }
+  state.kernel = kernel;
+  let states = kernelStates.get(kernel);
+  if (!states) {
+    states = new Set<PanelState>();
+    kernelStates.set(kernel, states);
+    const interrupt = kernel.interrupt.bind(kernel);
+    kernel.interrupt = async (): Promise<void> => {
+      const active = [...(states ?? [])].filter(
+        connected => connected.runningQuestions.size > 0
+      );
+      for (const connected of active) {
+        cancelQuestions(connected);
+      }
+      for (let attempt = 0; active.length > 0 && attempt < 50; attempt += 1) {
+        if (active.every(connected => connected.runningQuestions.size === 0)) {
+          return;
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      return interrupt();
+    };
+  }
+  states.add(state);
 }
 
 function questionMetadata(model: ICellModel): QuestionMetadata | null {
@@ -204,9 +251,11 @@ function registerKernel(panel: NotebookPanel): void {
 
   const panelState = panelStates.get(panel) ?? {
     comm: null,
+    kernel: null,
     runningQuestions: new Map<string, ICellModel>()
   };
   panelStates.set(panel, panelState);
+  connectInterrupt(kernel, panelState);
   panelState.comm = null;
   panelState.runningQuestions.clear();
 
@@ -271,7 +320,7 @@ function registerKernel(panel: NotebookPanel): void {
           panelState.runningQuestions.delete(data.cell_id);
           refreshQuestionCells(panel);
           finishTurn();
-          if (data.error) {
+          if (data.error && !data.cancelled) {
             void showErrorMessage(
               `Codebind question: ${data.error.type}`,
               data.error.message
@@ -396,9 +445,43 @@ async function runQuestion(panel: NotebookPanel): Promise<void> {
 }
 
 function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
-  panelStates.set(panel, {
+  const state: PanelState = {
     comm: null,
+    kernel: null,
     runningQuestions: new Map<string, ICellModel>()
+  };
+  panelStates.set(panel, state);
+  const onInterrupt = (event: Event): void => {
+    if (!cancelQuestions(state)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    window.setTimeout(() => {
+      if (state.runningQuestions.size > 0) {
+        void state.kernel?.interrupt();
+      }
+    }, 500);
+  };
+  let interruptButton: HTMLElement | null = null;
+  const connectInterruptButton = (): void => {
+    const button = panel.toolbar.node.querySelector<HTMLElement>(
+      '[data-command="notebook:interrupt-kernel"]'
+    );
+    if (button === interruptButton) {
+      return;
+    }
+    interruptButton?.removeEventListener('click', onInterrupt, true);
+    interruptButton = button;
+    interruptButton?.addEventListener('click', onInterrupt, true);
+  };
+  const toolbarObserver = new MutationObserver(connectInterruptButton);
+  toolbarObserver.observe(panel.toolbar.node, { childList: true, subtree: true });
+  connectInterruptButton();
+  panel.disposed.connect(() => {
+    toolbarObserver.disconnect();
+    interruptButton?.removeEventListener('click', onInterrupt, true);
   });
   panel.toolbar.insertItem(
     10,

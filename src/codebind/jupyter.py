@@ -122,6 +122,10 @@ class JupyterLabBridge:
         if data.get("type") == "ready":
             self.ready = True
             return
+        if data.get("type") == "cancel":
+            for task in tuple(self._tasks):
+                task.cancel()
+            return
         if data.get("type") != "question":
             return
         cell_id = data.get("cell_id")
@@ -135,10 +139,13 @@ class JupyterLabBridge:
 
     async def _answer_question(self, cell_id: str, question: str, model: str) -> None:
         error: dict[str, str] | None = None
+        cancelled = False
         try:
             if self._question_handler is None:
                 raise RuntimeError("Codebind is not ready to receive questions.")
             await self._question_handler(question, model)
+        except asyncio.CancelledError:
+            cancelled = True
         except Exception as exception:
             error = {"type": type(exception).__name__, "message": str(exception)}
         self._comm.send(
@@ -146,5 +153,6 @@ class JupyterLabBridge:
                 "type": "question_finished",
                 "cell_id": cell_id,
                 "error": error,
+                "cancelled": cancelled,
             }
         )
