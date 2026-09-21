@@ -1,10 +1,8 @@
 # Codebind
 
-Codebind is an IPython extension that runs a model with one tool: an IPython cell executed in the active session. IPython owns execution, namespace, history, magics, tracebacks, and rich display; Codebind owns only conversation and model orchestration.
+Codebind turns an ordinary IPython session into a durable model harness with one tool: an IPython cell executed in the active session. IPython owns execution, namespace, history, magics, tracebacks, and rich display; Codebind owns conversation state and model orchestration.
 
 ## Installation
-
-Run Codebind without installing it permanently:
 
 ```console
 uvx codebind
@@ -16,36 +14,50 @@ Or install it with any Python package installer:
 pip install codebind
 ```
 
-After installation, start ordinary IPython with the Codebind extension from any directory:
+## Configuration
+
+Codebind reads its private model choice from `$XDG_CONFIG_HOME/codebind/configuration.json`, or `~/.config/codebind/configuration.json` when `XDG_CONFIG_HOME` is unset:
+
+```json
+{
+  "model": "openai/gpt-5.6-luna",
+  "parameters": {
+    "reasoning_effort": "medium"
+  }
+}
+```
+
+Provider credentials use the same XDG directory in `models.json`. Keep both files readable only by their owner. Loading Codebind does not add `chat`, `model`, `models`, `Models`, or any other variable to the IPython namespace.
+
+## Terminal IPython
+
+Start a new conversation:
 
 ```console
-codebind
+uvx codebind
 ```
 
-It opens standard IPython with `chat`, `models`, and `Models` in the user namespace. `models` loads provider values from `$XDG_CONFIG_HOME/codebind/models.json`, or `~/.config/codebind/models.json` when `XDG_CONFIG_HOME` is unset. Keep that credential file readable only by its owner. All normal IPython command-line options remain available.
+Ask through ordinary IPython magic syntax:
 
 ```python
-chat.send(
-    "Inspect this project and tell me what to implement first.",
-    models.chat("openai/gpt-5", reasoning_effort="medium"),
-)
+%%question
+Inspect this project and tell me what to implement first.
 ```
 
-Codebind does not load files or construct a project prompt automatically. The user states what should be loaded as context. Pass `instructions=` to `Session` only when an application needs its own system instructions.
+Terminal conversations remain live for the current IPython process. Durable automatic resumption belongs to notebooks, where the notebook file provides an unambiguous conversation identity.
 
-## Jupyter
-
-Start JupyterLab with Codebind from any directory without a permanent installation:
+## JupyterLab
 
 ```console
 uvx --from jupyterlab --with codebind --with 'nbconvert[webpdf]' jupyter lab
 ```
 
-Or install both packages into the same environment, then start JupyterLab normally:
+When running an unpublished local checkout, expose both its editable Python source and its current prebuilt frontend:
 
 ```console
-pip install codebind jupyterlab
-jupyter lab
+JUPYTER_PATH=/path/to/codebind/data/share/jupyter \
+uvx --refresh --from jupyterlab --with-editable /path/to/codebind \
+  --with 'nbconvert[webpdf]' jupyter-lab
 ```
 
 Load Codebind in a notebook:
@@ -54,37 +66,22 @@ Load Codebind in a notebook:
 %load_ext codebind
 ```
 
-Run that cell once so JupyterLab can connect to the extension, then use Codebind in later cells:
+That is the complete setup. **Question** is a native toolbar toggle. Turning it on converts the selected cell into a Question and automatically makes each newly created user cell a Question until the toggle is turned off. Codebind-generated instruction, tool, and answer cells are never converted. Write ordinary Markdown and press `Shift+Enter`.
 
-```python
-model = models.chat("openai/gpt-5")
-await chat.asend("Inspect the current notebook state.", model)
-```
+Loading the extension adds a locked Markdown cell containing Codebind's packaged instructions. That exact text becomes the conversation's immutable system message and remains stable when the server or kernel restarts.
 
-After assigning `model`, select a cell and click **Question** in the notebook toolbar to configure that cell as a Question cell. Write ordinary Markdown and press `Shift+Enter`; Codebind sends the cell through `chat` using the `model` variable, renders the question as Markdown, and appends tool executions and the assistant response to the end of the notebook. Jupyter's standard interrupt button cancels an active Codebind question. Question cells are stored as standard Markdown cells with Codebind metadata, so other notebook frontends can still read them.
+The whole notebook is model context. Before each Question, Codebind takes a canonical snapshot of ordinary Markdown, raw, and code cells, including compact visible text outputs but never the live Python namespace. The first turn records the snapshot; later turns append only new, changed, removed, or reordered cells. Questions, tool calls, tool results, and answers already present in the conversation ledger are not duplicated. This append-only representation keeps the prior model prefix unchanged for provider caching.
 
-The Codebind package includes a prebuilt JupyterLab extension. In JupyterLab, each model-authored IPython execution becomes a genuine code cell with its native execution count and outputs, and the assistant response becomes a rendered Markdown cell. The cells are ordinary notebook content and are saved with the notebook.
+Codebind stores the complete LangChain message, notebook-context, and turn ledger in notebook metadata. Reopening the notebook, restarting its kernel, and loading the extension restores the exact accumulated context automatically. Tool executions and assistant answers are always appended to the notebook end without changing the user's current selection or scroll position. Tool outputs are collapsed by default and remain expandable through JupyterLab's native output control.
 
-Other IPython frontends use the standard MIME display protocol instead. They still receive syntax-highlighted code, assistant Markdown, stdout, tracebacks, rich results, and native IPython history without Codebind depending on their UI.
+An interrupted tool call is closed with an explicit interrupted result before the turn ends. If a provider stream is cancelled or fails, Codebind discards that provider session before the next Question while retaining the notebook conversation and its stable prompt-cache identity.
 
-## ChatGPT account login
+The instruction cell, sent Question cells, model-authored tool cells, and assistant Markdown cells are non-editable and non-deletable. Draft Question cells remain editable until they are sent. Jupyter's standard interrupt button cancels an active Codebind question.
 
-Models Provider can start its OpenAI browser sign-in flow directly from IPython:
+Question and assistant Markdown supports `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` through JupyterLab's native MathJax renderer.
 
-```python
-import webbrowser
+Other IPython frontends retain standard MIME display, syntax-highlighted code, Markdown, stdout, tracebacks, rich results, and native IPython history.
 
-models = Models()
-authorization = await models.sign_in("openai")
-webbrowser.open(authorization.url)
-await authorization.complete()
+## ChatGPT account access
 
-chat.send(
-    "Inspect this project.",
-    models.chat("openai/gpt-5", authorization=authorization),
-)
-```
-
-The authorization remains in memory for this session. Save provider values as a JSON object in Codebind's XDG configuration file and reload the extension to expose them through `models`.
-
-OpenAI officially supports ChatGPT subscription sign-in for Codex clients. Models Provider reproduces that account-access boundary for this library; it is separate from the public, pay-as-you-go OpenAI API and may require compatibility updates when the Codex account protocol changes.
+Models Provider owns OpenAI account authorization and token refresh. Save the resulting provider-values object in Codebind's XDG `models.json`; Codebind loads it privately when the extension starts. ChatGPT subscription access is separate from the public, pay-as-you-go OpenAI API and may require compatibility updates when the account protocol changes.

@@ -14,6 +14,7 @@ import { Kernel, KernelMessage } from '@jupyterlab/services';
 
 const TARGET_NAME = 'codebind';
 const INSERT_QUESTION = 'codebind:insert-question';
+const TOGGLE_QUESTION_MODE = 'codebind:toggle-question-mode';
 const RUN_QUESTION = 'codebind:run-question';
 const QUESTION_CLASS = 'jp-CodebindQuestionCell';
 
@@ -47,11 +48,32 @@ interface MarkdownCellMessage {
   source: string;
 }
 
+interface InstructionsCellMessage {
+  type: 'instructions_cell';
+  source: string;
+}
+
 interface QuestionFinishedMessage {
   type: 'question_finished';
   cell_id: string;
   error: { type: string; message: string } | null;
   cancelled: boolean;
+}
+
+interface QuestionStartedMessage {
+  type: 'question_started';
+  cell_id: string;
+}
+
+interface SessionReadyMessage {
+  type: 'session_ready';
+  error: { type: string; message: string } | null;
+}
+
+interface ConversationSaveMessage {
+  type: 'conversation_save';
+  request_id: string;
+  conversation: Record<string, unknown>;
 }
 
 type CodebindMessage =
@@ -60,7 +82,11 @@ type CodebindMessage =
   | CodeCellOutputMessage
   | CodeCellClearMessage
   | MarkdownCellMessage
-  | QuestionFinishedMessage;
+  | InstructionsCellMessage
+  | QuestionStartedMessage
+  | QuestionFinishedMessage
+  | SessionReadyMessage
+  | ConversationSaveMessage;
 type InsertMessage = CodeCellStartedMessage | MarkdownCellMessage;
 
 interface TurnState {
@@ -72,11 +98,32 @@ interface PanelState {
   comm: Kernel.IComm | null;
   kernel: Kernel.IKernelConnection | null;
   runningQuestions: Map<string, ICellModel>;
+  questionTimers: Map<string, number>;
+  sessionReady: boolean;
+  sessionError: string | null;
+  questionMode: boolean;
+  questionButton: ToolbarButton | null;
+  knownCellIds: Set<string>;
+  pendingQuestionCellIds: Set<string>;
 }
 
 interface QuestionMetadata {
   kind: 'question';
-  model: string;
+  status: 'draft' | 'sent';
+}
+
+type JsonValue = string | number | boolean | null | JsonObject | JsonValue[];
+
+interface JsonObject {
+  [key: string]: JsonValue;
+}
+
+interface NotebookCellContext extends JsonObject {
+  id: string;
+  type: 'code' | 'markdown' | 'raw';
+  source: string;
+  execution_count: number | null;
+  outputs: JsonObject[];
 }
 
 const panelStates = new WeakMap<NotebookPanel, PanelState>();
@@ -98,7 +145,10 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
     return false;
   }
   const message = value as Record<string, unknown>;
-  if (message.type === 'markdown_cell') {
+  if (
+    message.type === 'markdown_cell' ||
+    message.type === 'instructions_cell'
+  ) {
     return typeof message.source === 'string';
   }
   if (message.type === 'code_cell_started') {
@@ -126,6 +176,25 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
         (typeof error === 'object' &&
           typeof (error as Record<string, unknown>).type === 'string' &&
           typeof (error as Record<string, unknown>).message === 'string'))
+    );
+  }
+  if (message.type === 'question_started') {
+    return typeof message.cell_id === 'string';
+  }
+  if (message.type === 'session_ready') {
+    const error = message.error;
+    return (
+      error === null ||
+      (typeof error === 'object' &&
+        typeof (error as Record<string, unknown>).type === 'string' &&
+        typeof (error as Record<string, unknown>).message === 'string')
+    );
+  }
+  if (message.type === 'conversation_save') {
+    return (
+      typeof message.request_id === 'string' &&
+      typeof message.conversation === 'object' &&
+      message.conversation !== null
     );
   }
   return (
@@ -180,8 +249,92 @@ function questionMetadata(model: ICellModel): QuestionMetadata | null {
   }
   return {
     kind: 'question',
-    model: typeof metadata.model === 'string' ? metadata.model : 'model'
+    status: metadata.status === 'draft' ? 'draft' : 'sent'
   };
+}
+
+function codebindKind(model: ICellModel): string | null {
+  const value = model.getMetadata('codebind');
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+  const kind = (value as Record<string, unknown>).kind;
+  return typeof kind === 'string' ? kind : null;
+}
+
+function compactMimeBundle(bundle: nbformat.IMimeBundle): JsonObject {
+  const data: JsonObject = {};
+  const omitted: string[] = [];
+  for (const [mime, value] of Object.entries(bundle)) {
+    if (
+      mime.startsWith('text/') ||
+      mime === 'application/json' ||
+      mime === 'application/vnd.jupyter.stdout' ||
+      mime === 'application/vnd.jupyter.stderr'
+    ) {
+      if (value !== undefined) {
+        data[mime] = value as JsonValue;
+      }
+    } else {
+      omitted.push(mime);
+    }
+  }
+  if (omitted.length > 0) {
+    data.omitted_mime_types = omitted;
+  }
+  return data;
+}
+
+function compactOutput(output: nbformat.IOutput): JsonObject {
+  if (nbformat.isStream(output)) {
+    return { type: 'stream', name: output.name, text: output.text };
+  }
+  if (nbformat.isError(output)) {
+    return {
+      type: 'error',
+      name: output.ename,
+      message: output.evalue,
+      traceback: output.traceback
+    };
+  }
+  if (nbformat.isExecuteResult(output)) {
+    return {
+      type: 'result',
+      execution_count: output.execution_count,
+      data: compactMimeBundle(output.data)
+    };
+  }
+  if (nbformat.isDisplayData(output)) {
+    return { type: 'display', data: compactMimeBundle(output.data) };
+  }
+  return { type: output.output_type };
+}
+
+function notebookSnapshot(panel: NotebookPanel): NotebookCellContext[] {
+  const cells: NotebookCellContext[] = [];
+  for (const widget of panel.content.widgets) {
+    if (codebindKind(widget.model) !== null) {
+      continue;
+    }
+    const type = widget.model.type;
+    if (type !== 'code' && type !== 'markdown' && type !== 'raw') {
+      continue;
+    }
+    const cell: NotebookCellContext = {
+      id: widget.model.id,
+      type,
+      source: widget.model.sharedModel.getSource(),
+      execution_count: null,
+      outputs: []
+    };
+    if (type === 'code') {
+      const code = widget.model.toJSON() as nbformat.ICodeCell;
+      cell.execution_count = code.execution_count;
+      cell.outputs = code.outputs.map(compactOutput);
+    }
+    cells.push(cell);
+  }
+  return cells;
 }
 
 function normalizeMathDelimiters(source: string): string {
@@ -198,10 +351,11 @@ function refreshQuestionCells(panel: NotebookPanel): void {
       continue;
     }
     if (question) {
+      cell.readOnly = question.status === 'sent';
       prompt.dataset.codebindQuestion = 'true';
       prompt.textContent = state?.runningQuestions.has(cell.model.id)
-        ? 'Question [*]:'
-        : 'Question:';
+        ? '[*]:'
+        : '[ ]:';
     } else if (prompt.dataset.codebindQuestion) {
       delete prompt.dataset.codebindQuestion;
       prompt.textContent = '';
@@ -224,7 +378,13 @@ function insertCell(
     model.sharedModel.insertCell(index, {
       cell_type: 'code',
       source: message.source,
-      metadata: { trusted: true },
+      metadata: {
+        trusted: true,
+        collapsed: true,
+        editable: false,
+        deletable: false,
+        codebind: { kind: 'tool' }
+      },
       execution_count: null,
       outputs: []
     });
@@ -232,15 +392,80 @@ function insertCell(
     model.sharedModel.insertCell(index, {
       cell_type: 'markdown',
       source: normalizeMathDelimiters(message.source),
-      metadata: {}
+      metadata: {
+        editable: false,
+        deletable: false,
+        codebind: { kind: 'assistant' }
+      }
     });
   }
 
   const cell = notebook.widgets[index] ?? null;
+  if (cell) {
+    cell.readOnly = true;
+  }
   if (cell instanceof MarkdownCell) {
     cell.rendered = true;
   }
   return cell?.model ?? null;
+}
+
+function ensureInstructionsCell(panel: NotebookPanel, source: string): void {
+  const notebook = panel.content;
+  const model = notebook.model;
+  if (!model) {
+    return;
+  }
+  let changed = false;
+  let index = notebook.widgets.findIndex(
+    widget => codebindKind(widget.model) === 'instructions'
+  );
+  if (index < 0) {
+    const activeId = notebook.activeCell?.model.id ?? null;
+    model.sharedModel.insertCell(0, {
+      cell_type: 'markdown',
+      source,
+      metadata: {
+        editable: false,
+        deletable: false,
+        codebind: { kind: 'instructions' }
+      }
+    });
+    index = 0;
+    changed = true;
+    if (activeId !== null) {
+      const activeIndex = notebook.widgets.findIndex(
+        widget => widget.model.id === activeId
+      );
+      if (activeIndex >= 0) {
+        notebook.activeCellIndex = activeIndex;
+      }
+    }
+  }
+  const cell = notebook.widgets[index];
+  if (!cell) {
+    return;
+  }
+  if (cell.model.sharedModel.getSource() !== source) {
+    cell.model.sharedModel.setSource(source);
+    changed = true;
+  }
+  if (cell.model.getMetadata('editable') !== false) {
+    changed = true;
+  }
+  if (cell.model.getMetadata('deletable') !== false) {
+    changed = true;
+  }
+  cell.model.setMetadata('editable', false);
+  cell.model.setMetadata('deletable', false);
+  cell.model.setMetadata('codebind', { kind: 'instructions' });
+  cell.readOnly = true;
+  if (cell instanceof MarkdownCell) {
+    cell.rendered = true;
+  }
+  if (changed) {
+    void panel.context.save();
+  }
 }
 
 function registerKernel(panel: NotebookPanel): void {
@@ -252,12 +477,25 @@ function registerKernel(panel: NotebookPanel): void {
   const panelState = panelStates.get(panel) ?? {
     comm: null,
     kernel: null,
-    runningQuestions: new Map<string, ICellModel>()
+    runningQuestions: new Map<string, ICellModel>(),
+    questionTimers: new Map<string, number>(),
+    sessionReady: false,
+    sessionError: null,
+    questionMode: false,
+    questionButton: null,
+    knownCellIds: new Set(panel.content.widgets.map(widget => widget.model.id)),
+    pendingQuestionCellIds: new Set<string>()
   };
   panelStates.set(panel, panelState);
   connectInterrupt(kernel, panelState);
   panelState.comm = null;
   panelState.runningQuestions.clear();
+  for (const timer of panelState.questionTimers.values()) {
+    window.clearTimeout(timer);
+  }
+  panelState.questionTimers.clear();
+  panelState.sessionReady = false;
+  panelState.sessionError = null;
 
   let turn: TurnState | null = null;
   const codeCells = new Map<string, ICodeCellModel>();
@@ -316,7 +554,64 @@ function registerKernel(panel: NotebookPanel): void {
         if (!isCodebindMessage(data)) {
           return;
         }
+        if (data.type === 'conversation_save') {
+          const notebookModel = panel.content.model;
+          if (!notebookModel) {
+            comm.send({
+              type: 'conversation_saved',
+              request_id: data.request_id,
+              error: 'Notebook model is unavailable.'
+            });
+            return;
+          }
+          notebookModel.setMetadata('codebind', data.conversation);
+          void panel.context.save().then(
+            () => {
+              comm.send({
+                type: 'conversation_saved',
+                request_id: data.request_id,
+                error: null
+              });
+            },
+            error => {
+              comm.send({
+                type: 'conversation_saved',
+                request_id: data.request_id,
+                error: String(error)
+              });
+            }
+          );
+          return;
+        }
+        if (data.type === 'instructions_cell') {
+          ensureInstructionsCell(panel, data.source);
+          return;
+        }
+        if (data.type === 'session_ready') {
+          panelState.sessionReady = data.error === null;
+          panelState.sessionError = data.error?.message ?? null;
+          if (data.error) {
+            void showErrorMessage(
+              `Codebind could not load: ${data.error.type}`,
+              data.error.message
+            );
+          }
+          return;
+        }
+        if (data.type === 'question_started') {
+          const timer = panelState.questionTimers.get(data.cell_id);
+          if (timer !== undefined) {
+            window.clearTimeout(timer);
+            panelState.questionTimers.delete(data.cell_id);
+          }
+          return;
+        }
         if (data.type === 'question_finished') {
+          const timer = panelState.questionTimers.get(data.cell_id);
+          if (timer !== undefined) {
+            window.clearTimeout(timer);
+            panelState.questionTimers.delete(data.cell_id);
+          }
           panelState.runningQuestions.delete(data.cell_id);
           refreshQuestionCells(panel);
           finishTurn();
@@ -366,9 +661,17 @@ function registerKernel(panel: NotebookPanel): void {
       comm.onClose = () => {
         if (panelState.comm === comm) {
           panelState.comm = null;
+          panelState.sessionReady = false;
         }
       };
-      comm.send({ type: 'ready' });
+      const conversation = panel.content.model?.getMetadata('codebind');
+      comm.send({
+        type: 'ready',
+        conversation:
+          typeof conversation === 'object' && conversation !== null
+            ? conversation
+            : null
+      });
     }
   );
 }
@@ -390,13 +693,75 @@ function configureQuestion(panel: NotebookPanel): void {
     NotebookActions.changeCellType(notebook, 'markdown');
   }
   const cell = notebook.activeCell;
-  cell?.model.setMetadata('codebind', { kind: 'question', model: 'model' });
+  if (cell && codebindKind(cell.model) !== null) {
+    return;
+  }
+  cell?.model.setMetadata('codebind', { kind: 'question', status: 'draft' });
   if (cell instanceof MarkdownCell) {
     cell.rendered = false;
   }
   notebook.mode = 'edit';
   refreshQuestionCells(panel);
   cell?.editor?.focus();
+}
+
+function refreshQuestionMode(panel: NotebookPanel): void {
+  const state = panelStates.get(panel);
+  if (!state) {
+    return;
+  }
+  const widgets = panel.content.widgets;
+  const currentIds = new Set(widgets.map(widget => widget.model.id));
+  const added = widgets.filter(widget => !state.knownCellIds.has(widget.model.id));
+  state.knownCellIds = currentIds;
+  for (const identifier of state.pendingQuestionCellIds) {
+    if (!currentIds.has(identifier)) {
+      state.pendingQuestionCellIds.delete(identifier);
+    }
+  }
+  if (state.questionMode) {
+    for (const widget of added) {
+      if (codebindKind(widget.model) === null) {
+        state.pendingQuestionCellIds.add(widget.model.id);
+      }
+    }
+  }
+  refreshQuestionCells(panel);
+  if (!state.questionMode || !panel.content.activeCell) {
+    return;
+  }
+  if (state.pendingQuestionCellIds.delete(panel.content.activeCell.model.id)) {
+    configureQuestion(panel);
+  }
+}
+
+function toggleQuestionMode(panel: NotebookPanel): void {
+  const state = panelStates.get(panel);
+  if (!state) {
+    return;
+  }
+  setQuestionMode(panel, !state.questionMode);
+}
+
+function setQuestionMode(panel: NotebookPanel, enabled: boolean): void {
+  const state = panelStates.get(panel);
+  if (!state) {
+    return;
+  }
+  state.questionMode = enabled;
+  if (!state.questionMode) {
+    state.pendingQuestionCellIds.clear();
+  }
+  if (state.questionButton) {
+    state.questionButton.pressed = state.questionMode;
+  }
+  if (
+    state.questionMode &&
+    panel.content.activeCell &&
+    codebindKind(panel.content.activeCell.model) === null
+  ) {
+    configureQuestion(panel);
+  }
 }
 
 async function runQuestion(panel: NotebookPanel): Promise<void> {
@@ -417,6 +782,24 @@ async function runQuestion(panel: NotebookPanel): Promise<void> {
     );
     return;
   }
+  for (
+    let attempt = 0;
+    !state.sessionReady && !state.sessionError && state.comm && attempt < 600;
+    attempt += 1
+  ) {
+    await new Promise<void>(resolve => window.setTimeout(resolve, 50));
+  }
+  if (state.sessionError) {
+    await showErrorMessage('Codebind could not load', state.sessionError);
+    return;
+  }
+  if (!state.sessionReady) {
+    await showErrorMessage(
+      'Codebind did not finish loading',
+      'Reload Codebind and send the Question again.'
+    );
+    return;
+  }
   if (state.runningQuestions.size > 0) {
     await showErrorMessage(
       'Codebind is busy',
@@ -431,16 +814,37 @@ async function runQuestion(panel: NotebookPanel): Promise<void> {
   }
   state.runningQuestions.set(cell.model.id, cell.model);
   cell.model.sharedModel.setSource(normalizeMathDelimiters(question));
+  cell.model.setMetadata('codebind', { kind: 'question', status: 'sent' });
+  cell.model.setMetadata('editable', false);
+  cell.model.setMetadata('deletable', false);
+  cell.readOnly = true;
   refreshQuestionCells(panel);
   if (cell instanceof MarkdownCell) {
     cell.rendered = true;
   }
   notebook.mode = 'command';
+  const timer = window.setTimeout(() => {
+    if (!state.questionTimers.has(cell.model.id)) {
+      return;
+    }
+    state.questionTimers.delete(cell.model.id);
+    state.runningQuestions.delete(cell.model.id);
+    cell.model.setMetadata('codebind', { kind: 'question', status: 'draft' });
+    cell.model.setMetadata('editable', true);
+    cell.model.setMetadata('deletable', true);
+    cell.readOnly = false;
+    refreshQuestionCells(panel);
+    void showErrorMessage(
+      'Codebind did not receive the Question',
+      'The kernel did not acknowledge it. Reload Codebind and send it again.'
+    );
+  }, 10_000);
+  state.questionTimers.set(cell.model.id, timer);
   state.comm.send({
     type: 'question',
     cell_id: cell.model.id,
     question,
-    model: metadata.model
+    notebook: notebookSnapshot(panel)
   });
 }
 
@@ -448,7 +852,14 @@ function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
   const state: PanelState = {
     comm: null,
     kernel: null,
-    runningQuestions: new Map<string, ICellModel>()
+    runningQuestions: new Map<string, ICellModel>(),
+    questionTimers: new Map<string, number>(),
+    sessionReady: false,
+    sessionError: null,
+    questionMode: false,
+    questionButton: null,
+    knownCellIds: new Set(panel.content.widgets.map(widget => widget.model.id)),
+    pendingQuestionCellIds: new Set<string>()
   };
   panelStates.set(panel, state);
   const onInterrupt = (event: Event): void => {
@@ -478,24 +889,46 @@ function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
   };
   const toolbarObserver = new MutationObserver(connectInterruptButton);
   toolbarObserver.observe(panel.toolbar.node, { childList: true, subtree: true });
+  const cellObserver = new MutationObserver(() => {
+    window.setTimeout(() => refreshQuestionMode(panel), 0);
+  });
+  cellObserver.observe(panel.content.node, { childList: true, subtree: true });
   connectInterruptButton();
   panel.disposed.connect(() => {
     toolbarObserver.disconnect();
+    cellObserver.disconnect();
     interruptButton?.removeEventListener('click', onInterrupt, true);
+    for (const timer of state.questionTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    state.questionTimers.clear();
   });
+  const questionButton = new ToolbarButton({
+    label: 'Question',
+    tooltip: 'Toggle Question mode for the selected and newly created cells',
+    onClick: () => {
+      setQuestionMode(panel, questionButton.pressed);
+      app.commands.notifyCommandChanged(TOGGLE_QUESTION_MODE);
+    }
+  });
+  state.questionButton = questionButton;
   panel.toolbar.insertItem(
     10,
     'codebindQuestion',
-    new ToolbarButton({
-      label: 'Question',
-      tooltip: 'Use the selected cell as a Codebind Question',
-      onClick: () => {
-        void app.commands.execute(INSERT_QUESTION);
-      }
-    })
+    questionButton
   );
-  panel.content.modelContentChanged.connect(() => refreshQuestionCells(panel));
-  void panel.context.ready.then(() => refreshQuestionCells(panel));
+  panel.content.modelContentChanged.connect(() => {
+    refreshQuestionMode(panel);
+    window.setTimeout(() => refreshQuestionMode(panel), 0);
+  });
+  panel.content.activeCellChanged.connect(() => refreshQuestionMode(panel));
+  void panel.context.ready.then(() => {
+    panel.content.model?.cells.changed.connect(() => {
+      refreshQuestionMode(panel);
+      window.setTimeout(() => refreshQuestionMode(panel), 0);
+    });
+    refreshQuestionMode(panel);
+  });
   void panel.sessionContext.ready.then(() => registerKernel(panel));
   panel.sessionContext.kernelChanged.connect(() => registerKernel(panel));
 }
@@ -512,6 +945,20 @@ const plugin: JupyterFrontEndPlugin<void> = {
         const panel = tracker.currentWidget;
         if (panel) {
           configureQuestion(panel);
+        }
+      }
+    });
+    app.commands.addCommand(TOGGLE_QUESTION_MODE, {
+      label: 'Toggle Codebind Question Mode',
+      isToggled: () => {
+        const panel = tracker.currentWidget;
+        return panel ? (panelStates.get(panel)?.questionMode ?? false) : false;
+      },
+      execute: () => {
+        const panel = tracker.currentWidget;
+        if (panel) {
+          toggleQuestionMode(panel);
+          app.commands.notifyCommandChanged(TOGGLE_QUESTION_MODE);
         }
       }
     });
