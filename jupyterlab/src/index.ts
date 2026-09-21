@@ -16,8 +16,6 @@ const TARGET_NAME = 'codebind';
 const INSERT_QUESTION = 'codebind:insert-question';
 const RUN_QUESTION = 'codebind:run-question';
 const QUESTION_CLASS = 'jp-CodebindQuestionCell';
-const QUESTION_RUNNING_CLASS = 'jp-CodebindQuestionCell-running';
-const QUESTION_ERROR_CLASS = 'jp-CodebindQuestionCell-error';
 
 interface CodeCellStartedMessage {
   type: 'code_cell_started';
@@ -146,43 +144,20 @@ function refreshQuestionCells(panel: NotebookPanel): void {
   for (const cell of panel.content.widgets) {
     const question = questionMetadata(cell.model);
     cell.node.classList.toggle(QUESTION_CLASS, question !== null);
-    cell.node.classList.toggle(
-      QUESTION_RUNNING_CLASS,
-      state?.runningQuestions.has(cell.model.id) ?? false
-    );
+    const prompt = cell.node.querySelector<HTMLElement>('.jp-InputPrompt');
+    if (!prompt) {
+      continue;
+    }
+    if (question) {
+      prompt.dataset.codebindQuestion = 'true';
+      prompt.textContent = state?.runningQuestions.has(cell.model.id)
+        ? 'Question [*]:'
+        : 'Question:';
+    } else if (prompt.dataset.codebindQuestion) {
+      delete prompt.dataset.codebindQuestion;
+      prompt.textContent = '';
+    }
   }
-}
-
-function ensureStyles(): void {
-  if (document.getElementById('codebind-question-styles')) {
-    return;
-  }
-  const style = document.createElement('style');
-  style.id = 'codebind-question-styles';
-  style.textContent = `
-    .${QUESTION_CLASS} {
-      border-left: 3px solid var(--jp-brand-color1);
-      background: color-mix(in srgb, var(--jp-brand-color1) 6%, transparent);
-    }
-    .${QUESTION_CLASS} .jp-Cell-inputWrapper::before {
-      content: "Question";
-      display: block;
-      padding: 4px 10px 0;
-      color: var(--jp-brand-color1);
-      font-size: var(--jp-ui-font-size0);
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .${QUESTION_RUNNING_CLASS} {
-      border-left-color: var(--jp-warn-color1);
-      opacity: 0.78;
-    }
-    .${QUESTION_ERROR_CLASS} {
-      border-left-color: var(--jp-error-color1);
-    }
-  `;
-  document.head.appendChild(style);
 }
 
 function insertCell(
@@ -309,15 +284,7 @@ function registerKernel(panel: NotebookPanel): void {
           return;
         }
         if (data.type === 'question_finished') {
-          const model = panelState.runningQuestions.get(data.cell_id);
           panelState.runningQuestions.delete(data.cell_id);
-          if (model) {
-            const widget = panel.content.widgets.find(cell => cell.model === model);
-            widget?.node.classList.toggle(
-              QUESTION_ERROR_CLASS,
-              data.error !== null
-            );
-          }
           refreshQuestionCells(panel);
           finishTurn(false);
           if (data.error) {
@@ -429,7 +396,6 @@ async function runQuestion(panel: NotebookPanel): Promise<void> {
     await showErrorMessage('Empty Codebind question', 'Write a question before sending it.');
     return;
   }
-  cell.node.classList.remove(QUESTION_ERROR_CLASS);
   state.runningQuestions.set(cell.model.id, cell.model);
   refreshQuestionCells(panel);
   if (cell instanceof MarkdownCell) {
@@ -472,7 +438,6 @@ const plugin: JupyterFrontEndPlugin<void> = {
   autoStart: true,
   requires: [INotebookTracker],
   activate: (app: JupyterFrontEnd, tracker: INotebookTracker): void => {
-    ensureStyles();
     app.commands.addCommand(INSERT_QUESTION, {
       label: 'Insert Codebind Question',
       execute: () => {
