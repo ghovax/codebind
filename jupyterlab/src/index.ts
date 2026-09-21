@@ -137,6 +137,10 @@ function questionMetadata(model: ICellModel): QuestionMetadata | null {
   };
 }
 
+function normalizeMathDelimiters(source: string): string {
+  return source.replace(/(^|[^\\])\\([()[\]])/g, '$1\\\\$2');
+}
+
 function refreshQuestionCells(panel: NotebookPanel): void {
   const state = panelStates.get(panel);
   for (const cell of panel.content.widgets) {
@@ -180,7 +184,7 @@ function insertCell(
   } else {
     model.sharedModel.insertCell(index, {
       cell_type: 'markdown',
-      source: message.source,
+      source: normalizeMathDelimiters(message.source),
       metadata: {}
     });
   }
@@ -377,6 +381,7 @@ async function runQuestion(panel: NotebookPanel): Promise<void> {
     return;
   }
   state.runningQuestions.set(cell.model.id, cell.model);
+  cell.model.sharedModel.setSource(normalizeMathDelimiters(question));
   refreshQuestionCells(panel);
   if (cell instanceof MarkdownCell) {
     cell.rendered = true;
