@@ -289,6 +289,9 @@ class Session:
         shown = ""
         try:
             for message in bound_model.stream(self.messages, **self._model_kwargs(model)):
+                tool_call_started = bool(
+                    message.tool_call_chunks if isinstance(message, AIMessageChunk) else False
+                )
                 if isinstance(message, AIMessageChunk):
                     aggregate = (
                         message
@@ -302,10 +305,14 @@ class Session:
                 else:
                     raise TypeError("model stream must return AIMessage chunks")
                 text = _message_text(current)
-                if text != shown:
+                if tool_call_started and text != shown:
                     cell_id = self._update_assistant_stream(cell_id, text)
                     shown = text
-            return self._completed_stream_message(aggregate, response), cell_id
+            completed = self._completed_stream_message(aggregate, response)
+            answer = _message_text(completed)
+            if answer != shown:
+                cell_id = self._update_assistant_stream(cell_id, answer)
+            return completed, cell_id
         except BaseException:
             self._cancel_assistant_stream(cell_id)
             raise
@@ -321,6 +328,9 @@ class Session:
         shown = ""
         try:
             async for message in bound_model.astream(self.messages, **self._model_kwargs(model)):
+                tool_call_started = bool(
+                    message.tool_call_chunks if isinstance(message, AIMessageChunk) else False
+                )
                 if isinstance(message, AIMessageChunk):
                     aggregate = (
                         message
@@ -334,10 +344,14 @@ class Session:
                 else:
                     raise TypeError("model stream must return AIMessage chunks")
                 text = _message_text(current)
-                if text != shown:
+                if tool_call_started and text != shown:
                     cell_id = self._update_assistant_stream(cell_id, text)
                     shown = text
-            return self._completed_stream_message(aggregate, response), cell_id
+            completed = self._completed_stream_message(aggregate, response)
+            answer = _message_text(completed)
+            if answer != shown:
+                cell_id = self._update_assistant_stream(cell_id, answer)
+            return completed, cell_id
         except BaseException:
             self._cancel_assistant_stream(cell_id)
             raise
