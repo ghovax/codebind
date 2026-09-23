@@ -248,6 +248,19 @@ class Session:
             status="error",
         )
 
+    @staticmethod
+    def _tool_message(report: ExecutionReport, identifier: str) -> ToolMessage:
+        summary = json.dumps(report.as_dict(), ensure_ascii=False)
+        if report.images:
+            return ToolMessage(
+                content_blocks=[
+                    {"type": "text", "text": summary},
+                    *(image.content_block() for image in report.images),
+                ],
+                tool_call_id=identifier,
+            )
+        return ToolMessage(summary, tool_call_id=identifier)
+
     def _pending_calls(self, turn_id: str) -> list[str]:
         if self.conversation is None:
             return []
@@ -463,10 +476,7 @@ class Session:
                 for call, identifier in zip(response.tool_calls, identifiers, strict=True):
                     report = self._execute_call(call)
                     self._append_message_sync(
-                        ToolMessage(
-                            json.dumps(report.as_dict(), ensure_ascii=False),
-                            tool_call_id=identifier,
-                        ),
+                        self._tool_message(report, identifier),
                         turn_id,
                     )
         except KeyboardInterrupt:
@@ -514,10 +524,7 @@ class Session:
                 for call, identifier in zip(response.tool_calls, identifiers, strict=True):
                     report = await self._aexecute_call(call)
                     await self._append_message(
-                        ToolMessage(
-                            json.dumps(report.as_dict(), ensure_ascii=False),
-                            tool_call_id=identifier,
-                        ),
+                        self._tool_message(report, identifier),
                         turn_id,
                     )
         except asyncio.CancelledError:

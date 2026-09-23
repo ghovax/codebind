@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, cast
 
 from IPython.core.displaypub import DisplayPublisher
@@ -13,7 +13,11 @@ from IPython.core.interactiveshell import InteractiveShell
 from IPython.utils.capture import capture_output
 
 from .display import display_cell
+from .images import PreparedImage, prepare_mime_image
 from .jupyter import JupyterLabBridge
+
+
+_MAXIMUM_IMAGES_PER_REPORT = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,10 +30,21 @@ class ExecutionReport:
     result: str | None
     displays: tuple[str, ...]
     error: dict[str, str] | None
+    images: tuple[PreparedImage, ...] = ()
+    image_omissions: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
-        """Return a JSON-serializable representation."""
-        return asdict(self)
+        """Return the text report and image descriptors without repeating image bytes."""
+        return {
+            "ok": self.ok,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "result": self.result,
+            "displays": self.displays,
+            "error": self.error,
+            "images": [image.descriptor() for image in self.images],
+            "image_omissions": self.image_omissions,
+        }
 
 
 class _ExecutionDisplayHook:
@@ -156,6 +171,7 @@ def _captured_execution(
             return
 
         previous_displayhook = sys.displayhook
+        previous_trap_hook = shell.display_trap.hook
         previous_showtraceback = shell.showtraceback
         previous_showsyntaxerror = shell.showsyntaxerror
         if on_output is not None:
@@ -169,12 +185,15 @@ def _captured_execution(
                     on_clear or (lambda wait: None),
                 ),
             )
-        sys.displayhook = _ExecutionDisplayHook(shell, expression_outputs, on_output)
+        execution_displayhook = _ExecutionDisplayHook(shell, expression_outputs, on_output)
+        shell.display_trap.hook = execution_displayhook
+        sys.displayhook = execution_displayhook
         shell.showtraceback = lambda *args, **kwargs: None
         shell.showsyntaxerror = lambda *args, **kwargs: None
         try:
             yield captured
         finally:
+            shell.display_trap.hook = previous_trap_hook
             sys.displayhook = previous_displayhook
             shell.showtraceback = previous_showtraceback
             shell.showsyntaxerror = previous_showsyntaxerror
@@ -221,7 +240,7 @@ class IPythonExecutor:
         else:
             captured.show()
 
-        return self._report(result, captured)
+        return self._report(result, captured, expression_outputs)
 
     async def aexecute(self, cell: str) -> ExecutionReport:
         """Execute an async-capable cell and replay its native rich output."""
@@ -258,7 +277,7 @@ class IPythonExecutor:
         else:
             captured.show()
 
-        return self._report(result, captured)
+        return self._report(result, captured, expression_outputs)
 
     def _stream_callbacks(
         self,
@@ -279,15 +298,39 @@ class IPythonExecutor:
 
         return on_output, on_clear
 
-    @staticmethod
-    def _report(result: Any, captured: Any) -> ExecutionReport:
-        """Build the model-facing text projection of an IPython execution."""
+    def _report(
+        self,
+        result: Any,
+        captured: Any,
+        expression_outputs: list[dict[str, Any]],
+    ) -> ExecutionReport:
+        """Build the model-facing text and image projection of an IPython execution."""
 
         displays: list[str] = []
-        for output in captured.outputs:
-            data = getattr(output, "data", None)
+        images: list[PreparedImage] = []
+        omissions: list[str] = []
+        bundles = [getattr(output, "data", None) for output in captured.outputs]
+        bundles.extend(output.get("data") for output in expression_outputs)
+        if not expression_outputs and result.result is not None:
+            data, _ = self.shell.display_formatter.format(result.result)
+            if any(key.startswith("image/") for key in data):
+                bundles.append(data)
+        for index, data in enumerate(bundles):
             if isinstance(data, dict) and "text/plain" in data:
                 displays.append(str(data["text/plain"]))
+            if not isinstance(data, dict):
+                continue
+            if len(images) >= _MAXIMUM_IMAGES_PER_REPORT:
+                if any(key.startswith("image/") for key in data):
+                    omissions.append(f"Display {index + 1}: image count limit reached")
+                continue
+            try:
+                image = prepare_mime_image(data)
+            except ValueError as error:
+                omissions.append(f"Display {index + 1}: {error}")
+            else:
+                if image is not None:
+                    images.append(image)
 
         exception = result.error_before_exec or result.error_in_exec
         error = (
@@ -302,6 +345,8 @@ class IPythonExecutor:
             result=repr(result.result) if result.result is not None else None,
             displays=tuple(displays),
             error=error,
+            images=tuple(images),
+            image_omissions=tuple(omissions),
         )
 
     def _notebook_outputs(

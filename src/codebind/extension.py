@@ -10,7 +10,7 @@ from langchain_core.language_models import BaseChatModel
 
 from .configuration import load_configuration, load_models
 from .conversation import MemoryConversationStore, NotebookConversationStore
-from .jupyter import JupyterLabBridge
+from .jupyter import JupyterLabBridge, TARGET_NAME
 from .session import Session
 
 
@@ -18,6 +18,10 @@ _STATE_ATTRIBUTE = "_codebind_extension_state"
 
 
 def _close_state(state: dict[str, Any]) -> None:
+    manager = state.get("comm_manager")
+    target = state.get("comm_target")
+    if manager is not None and getattr(manager, "targets", {}).get(TARGET_NAME) is target:
+        manager.unregister_target(TARGET_NAME, target)
     load_task = state.get("load_task")
     if isinstance(load_task, asyncio.Task):
         load_task.cancel()
@@ -59,19 +63,76 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             except Exception:
                 pass
 
-    bridge = JupyterLabBridge.connect(ipython)
-    store = NotebookConversationStore(bridge) if bridge is not None else MemoryConversationStore()
-    session = Session(shell=ipython, bridge=bridge, store=store)
+    manager = getattr(getattr(ipython, "kernel", None), "comm_manager", None)
+    state: dict[str, Any] = {
+        "session": None,
+        "bridge": None,
+        "load_task": None,
+        "get_model": get_model,
+        "discard_model": discard_model,
+        "comm_manager": manager,
+        "comm_target": None,
+    }
 
-    async def answer_question(question: str, notebook: list[dict[str, Any]]) -> None:
-        selected = get_model()
-        try:
-            await session.asend(question, selected, notebook=notebook)
-        except BaseException:
-            await discard_model()
-            raise
+    if manager is None:
+        state["session"] = Session(shell=ipython, store=MemoryConversationStore())
+    else:
+
+        def accept_comm(comm: Any, message: dict[str, Any]) -> None:
+            data = message.get("content", {}).get("data", {})
+            if not isinstance(data, dict):
+                raise ValueError("Invalid Codebind notebook connection")
+            conversation = data.get("conversation")
+            if conversation is not None and not isinstance(conversation, dict):
+                raise ValueError("Invalid Codebind conversation")
+
+            previous_task = state.get("load_task")
+            if isinstance(previous_task, asyncio.Task):
+                previous_task.cancel()
+            previous_bridge = state.get("bridge")
+            if isinstance(previous_bridge, JupyterLabBridge):
+                previous_bridge.close()
+
+            bridge = JupyterLabBridge(comm, conversation)
+            session = Session(
+                shell=ipython,
+                bridge=bridge,
+                store=NotebookConversationStore(bridge),
+            )
+
+            async def answer_question(question: str, notebook: list[dict[str, Any]]) -> None:
+                selected = get_model()
+                try:
+                    await session.asend(question, selected, notebook=notebook)
+                except BaseException:
+                    await discard_model()
+                    raise
+
+            async def prepare_session() -> None:
+                try:
+                    await session.aload()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    if bridge.ready:
+                        bridge.report_session_ready(error)
+                else:
+                    if bridge.ready:
+                        bridge.report_session_ready()
+
+            bridge.handle_questions(answer_question)
+            state["bridge"] = bridge
+            state["session"] = session
+            state["load_task"] = asyncio.get_running_loop().create_task(prepare_session())
+
+        manager.register_target(TARGET_NAME, accept_comm)
+        state["comm_target"] = accept_comm
 
     def question_magic(line: str, cell: str | None = None) -> None:
+        session = state.get("session")
+        if not isinstance(session, Session):
+            session = Session(shell=ipython, store=MemoryConversationStore())
+            state["session"] = session
         selected = get_model()
         try:
             session.send(cell if cell is not None else line, selected)
@@ -79,36 +140,8 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             asyncio.run(discard_model())
             raise
 
-    load_task: asyncio.Task[None] | None = None
-    if bridge is not None:
-        bridge.handle_questions(answer_question)
-
-        async def prepare_session() -> None:
-            try:
-                await session.aload()
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                bridge.report_session_ready(error)
-            else:
-                bridge.report_session_ready()
-
-        try:
-            load_task = asyncio.get_running_loop().create_task(prepare_session())
-        except RuntimeError:
-            pass
     ipython.register_magic_function(question_magic, "line_cell", "question")
-    setattr(
-        ipython,
-        _STATE_ATTRIBUTE,
-        {
-            "session": session,
-            "bridge": bridge,
-            "load_task": load_task,
-            "get_model": get_model,
-            "discard_model": discard_model,
-        },
-    )
+    setattr(ipython, _STATE_ATTRIBUTE, state)
 
 
 def unload_ipython_extension(ipython: InteractiveShell) -> None:

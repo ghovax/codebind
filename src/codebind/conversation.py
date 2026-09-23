@@ -18,6 +18,8 @@ from langchain_core.messages import (
     messages_from_dict,
 )
 
+from .images import PreparedImage, prepare_mime_image
+
 
 class ConversationStore(Protocol):
     async def load(self) -> dict[str, Any] | None: ...
@@ -155,7 +157,8 @@ class Conversation:
         turn_id: str,
     ) -> dict[str, Any] | None:
         current = self.notebook()
-        incoming = _normalize_notebook(cells)
+        images: list[tuple[str, PreparedImage]] = []
+        incoming = _normalize_notebook(cells, images)
         has_notebook = any(event.get("type") == "notebook" for event in self.events)
 
         if not has_notebook:
@@ -186,11 +189,19 @@ class Conversation:
             )
             + "</notebook-context>"
         )
+        previous_images = _image_digests(current)
+        blocks: list[dict[str, str]] = [{"type": "text", "text": content}]
+        for label, image in images:
+            if previous_images.get(label) == image.source_sha256:
+                continue
+            blocks.append({"type": "text", "text": f"Displayed image from {label}:"})
+            blocks.append(image.content_block())
+        message = HumanMessage(content_blocks=blocks) if len(blocks) > 1 else HumanMessage(content)
         return self.append(
             "notebook",
             turn_id=turn_id,
             **payload,
-            message=message_to_dict(HumanMessage(content)),
+            message=message_to_dict(message),
         )
 
     def rollback(self, event: dict[str, Any]) -> None:
@@ -303,7 +314,43 @@ class NotebookConversationStore:
         await self.bridge.save_conversation(value)
 
 
-def _normalize_notebook(value: Any) -> list[dict[str, Any]]:
+def _canonical_mime_bundle(
+    value: dict[str, Any],
+    label: str,
+    images: list[tuple[str, PreparedImage]] | None,
+) -> dict[str, Any]:
+    data = {key: deepcopy(item) for key, item in value.items() if not key.startswith("image/")}
+    try:
+        image = prepare_mime_image(value)
+    except ValueError as error:
+        data["image_omitted"] = str(error)
+    else:
+        if image is not None:
+            data["image"] = image.descriptor()
+            if images is not None:
+                images.append((label, image))
+    return data
+
+
+def _image_digests(cells: list[dict[str, Any]]) -> dict[str, str]:
+    digests: dict[str, str] = {}
+    for cell in cells:
+        identifier = cell["id"]
+        for index, output in enumerate(cell.get("outputs", [])):
+            descriptor = (output.get("data") or {}).get("image")
+            if isinstance(descriptor, dict) and isinstance(descriptor.get("source_sha256"), str):
+                digests[f"cell {identifier} output {index + 1}"] = descriptor["source_sha256"]
+        for name, bundle in cell.get("attachments", {}).items():
+            descriptor = bundle.get("image")
+            if isinstance(descriptor, dict) and isinstance(descriptor.get("source_sha256"), str):
+                digests[f"cell {identifier} attachment {name}"] = descriptor["source_sha256"]
+    return digests
+
+
+def _normalize_notebook(
+    value: Any,
+    images: list[tuple[str, PreparedImage]] | None = None,
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("Invalid Codebind notebook snapshot")
     cells: list[dict[str, Any]] = []
@@ -332,7 +379,34 @@ def _normalize_notebook(value: Any) -> list[dict[str, Any]]:
             ):
                 raise ValueError("Invalid Codebind code cell")
             cell["execution_count"] = execution_count
-            cell["outputs"] = deepcopy(outputs)
+            normalized_outputs: list[dict[str, Any]] = []
+            for index, output in enumerate(outputs):
+                if not isinstance(output, dict):
+                    raise ValueError("Invalid Codebind cell output")
+                normalized = deepcopy(output)
+                data = output.get("data")
+                if isinstance(data, dict):
+                    normalized["data"] = _canonical_mime_bundle(
+                        data,
+                        f"cell {identifier} output {index + 1}",
+                        images,
+                    )
+                normalized_outputs.append(normalized)
+            cell["outputs"] = normalized_outputs
+        attachments = raw_cell.get("attachments")
+        if attachments is not None:
+            if not isinstance(attachments, dict):
+                raise ValueError("Invalid Codebind cell attachments")
+            normalized_attachments: dict[str, Any] = {}
+            for name, bundle in attachments.items():
+                if not isinstance(name, str) or not isinstance(bundle, dict):
+                    raise ValueError("Invalid Codebind cell attachment")
+                normalized_attachments[name] = _canonical_mime_bundle(
+                    bundle,
+                    f"cell {identifier} attachment {name}",
+                    images,
+                )
+            cell["attachments"] = normalized_attachments
         cells.append(cell)
     return cells
 
