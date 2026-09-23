@@ -29,6 +29,7 @@ class JupyterLabBridge:
         self._save_waiters: dict[str, asyncio.Future[None]] = {}
         self.ready = False
         comm.on_msg(self._on_message)
+        comm.on_close(self._on_close)
 
     @classmethod
     def connect(cls, shell: InteractiveShell) -> JupyterLabBridge | None:
@@ -45,6 +46,13 @@ class JupyterLabBridge:
 
     def close(self) -> None:
         """Close the frontend connection."""
+        self._stop()
+        self._comm.close()
+
+    def _on_close(self, _message: dict[str, Any]) -> None:
+        self._stop()
+
+    def _stop(self) -> None:
         for task in self._tasks:
             task.cancel()
         self._tasks.clear()
@@ -52,7 +60,6 @@ class JupyterLabBridge:
             future.cancel()
         self._conversation_waiters.clear()
         self._save_waiters.clear()
-        self._comm.close()
         self.ready = False
 
     def handle_questions(self, handler: _QuestionHandler) -> None:
@@ -83,7 +90,7 @@ class JupyterLabBridge:
             }
         )
         try:
-            await asyncio.wait_for(future, _HANDSHAKE_TIMEOUT_SECONDS)
+            await future
         finally:
             self._save_waiters.pop(request_id, None)
 

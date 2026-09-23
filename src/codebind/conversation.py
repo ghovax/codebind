@@ -9,9 +9,14 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import uuid4
 
-from langchain_core.messages import BaseMessage, HumanMessage, message_to_dict, messages_from_dict
-
-_VERSION = 2
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+    message_to_dict,
+    messages_from_dict,
+)
 
 
 class ConversationStore(Protocol):
@@ -35,28 +40,39 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Conversation:
-        if value.get("version") != _VERSION:
-            raise ValueError("Unsupported Codebind conversation version")
+        if not isinstance(value, dict):
+            raise ValueError("Invalid Codebind conversation")
         identifier = value.get("id")
         events = value.get("events")
         revision = value.get("revision")
         cwd = value.get("cwd")
-        if not isinstance(identifier, str) or not isinstance(events, list):
+        if not isinstance(identifier, str) or not identifier or not isinstance(events, list):
             raise ValueError("Invalid Codebind conversation")
-        if not isinstance(revision, int) or revision != len(events):
+        if type(revision) is not int or revision != len(events):
             raise ValueError("Invalid Codebind conversation revision")
         if any(
-            not isinstance(event, dict) or event.get("sequence") != sequence
+            not isinstance(event, dict)
+            or type(event.get("sequence")) is not int
+            or event["sequence"] != sequence
+            or event.get("type") not in {"message", "notebook", "turn_started", "turn_finished"}
+            or not isinstance(event.get("turn_id"), str)
+            or (
+                event.get("type") == "turn_finished"
+                and event.get("status") not in {"completed", "cancelled", "failed", "interrupted"}
+            )
             for sequence, event in enumerate(events, start=1)
         ):
-            raise ValueError("Invalid Codebind conversation sequence")
+            raise ValueError("Invalid Codebind conversation event")
         if not isinstance(cwd, str):
-            cwd = ""
-        return cls(identifier, revision, deepcopy(events), cwd)
+            raise ValueError("Invalid Codebind conversation directory")
+        conversation = cls(identifier, revision, deepcopy(events), cwd)
+        conversation._validate_tool_history()
+        conversation.notebook()
+        conversation.messages()
+        return conversation
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "version": _VERSION,
             "id": self.id,
             "revision": self.revision,
             "cwd": self.cwd,
@@ -64,13 +80,74 @@ class Conversation:
         }
 
     def append(self, event_type: str, **data: Any) -> dict[str, Any]:
+        if event_type == "turn_finished" and self.pending_tool_calls({data.get("turn_id")}):
+            raise ValueError("Cannot finish a turn with unanswered tool calls")
         event = {"sequence": self.revision + 1, "type": event_type, **data}
         self.events.append(event)
         self.revision += 1
         return event
 
     def append_message(self, message: BaseMessage, turn_id: str) -> dict[str, Any]:
+        if isinstance(message, ToolMessage):
+            if message.tool_call_id not in dict(self.pending_tool_calls({turn_id})):
+                raise ValueError("Tool result has no matching unanswered call")
+        elif isinstance(message, AIMessage):
+            identifiers = [call.get("id") for call in message.tool_calls]
+            if any(not isinstance(value, str) or not value for value in identifiers):
+                raise ValueError("Assistant tool calls require IDs")
+            if len(identifiers) != len(set(identifiers)):
+                raise ValueError("Assistant tool call IDs must be unique")
         return self.append("message", turn_id=turn_id, message=message_to_dict(message))
+
+    def _validate_tool_history(self) -> None:
+        pending: dict[str, str] = {}
+        seen: set[str] = set()
+        for event in self.events:
+            turn_id = event.get("turn_id")
+            if event.get("type") == "turn_finished":
+                if turn_id in pending.values():
+                    raise ValueError("Finished turn contains unanswered tool calls")
+                continue
+            if event.get("type") != "message":
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict) or not isinstance(turn_id, str):
+                raise ValueError("Invalid Codebind message event")
+            data = message.get("data")
+            if not isinstance(data, dict):
+                raise ValueError("Invalid Codebind message data")
+            if message.get("type") == "ai":
+                calls = data.get("tool_calls") or []
+                if not isinstance(calls, list):
+                    raise ValueError("Invalid assistant tool calls")
+                additional = data.get("additional_kwargs") or {}
+                if not isinstance(additional, dict):
+                    raise ValueError("Invalid assistant response metadata")
+                response_items = additional.get("response_items")
+                if isinstance(response_items, list):
+                    raw_calls = [
+                        item.get("call_id")
+                        for item in response_items
+                        if isinstance(item, dict) and item.get("type") == "function_call"
+                    ]
+                    parsed_calls = [
+                        call.get("id") if isinstance(call, dict) else None for call in calls
+                    ]
+                    if raw_calls != parsed_calls:
+                        raise ValueError(
+                            "Assistant tool calls disagree with provider response items"
+                        )
+                for call in calls:
+                    identifier = call.get("id") if isinstance(call, dict) else None
+                    if not isinstance(identifier, str) or not identifier or identifier in seen:
+                        raise ValueError("Invalid or repeated assistant tool call ID")
+                    seen.add(identifier)
+                    pending[identifier] = turn_id
+            elif message.get("type") == "tool":
+                identifier = data.get("tool_call_id")
+                if not isinstance(identifier, str) or pending.get(identifier) != turn_id:
+                    raise ValueError("Tool result has no matching unanswered call")
+                del pending[identifier]
 
     def append_notebook(
         self,

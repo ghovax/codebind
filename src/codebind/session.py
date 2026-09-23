@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from importlib.resources import files
 from typing import Any
 from uuid import uuid4
@@ -24,6 +25,7 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.ai import add_ai_message_chunks
 from langchain_core.runnables import Runnable
+from models_provider import TransientProviderError
 
 from .display import display_assistant
 from .conversation import Conversation, ConversationStore, MemoryConversationStore
@@ -57,6 +59,8 @@ IPYTHON_TOOL = {
         },
     },
 }
+
+_MODEL_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -102,6 +106,7 @@ class Session:
         self._messages: list[BaseMessage] = []
         self.last_response: AIMessage | None = None
         self._load_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
 
     @property
     def messages(self) -> tuple[BaseMessage, ...]:
@@ -114,30 +119,32 @@ class Session:
             if self.conversation is not None:
                 return
             value = await self.store.load()
-            self.conversation = (
+            conversation = (
                 Conversation.from_dict(value)
                 if value is not None
                 else Conversation(id=getattr(self.store, "conversation_id", str(uuid4())))
             )
-            self._messages = self.conversation.messages()
+            unfinished = conversation.unfinished_turns()
+            for identifier, turn_id in conversation.pending_tool_calls(set(unfinished)):
+                message = self._interrupted_tool_message(identifier)
+                conversation.append_message(message, turn_id)
+            for turn_id in unfinished:
+                conversation.append("turn_finished", turn_id=turn_id, status="interrupted")
+            sent_instructions = False
+            if not conversation.events:
+                conversation.append_message(SystemMessage(self.instructions), "system")
+                if self.bridge is not None:
+                    self.bridge.ensure_instructions_cell(self.instructions)
+                    sent_instructions = True
+            if unfinished or value is None:
+                await self._await_durable(self.store.save(conversation.as_dict()))
+            self.conversation = conversation
+            self._messages = conversation.messages()
             self.last_response = next(
                 (message for message in reversed(self._messages) if isinstance(message, AIMessage)),
                 None,
             )
-            unfinished = self.conversation.unfinished_turns()
-            for identifier, turn_id in self.conversation.pending_tool_calls(set(unfinished)):
-                message = self._interrupted_tool_message(identifier)
-                self.conversation.append_message(message, turn_id)
-                self._messages.append(message)
-            for turn_id in unfinished:
-                self.conversation.append("turn_finished", turn_id=turn_id, status="interrupted")
-            if unfinished:
-                await self._save()
-            if not self.conversation.events:
-                if self.bridge is not None:
-                    self.bridge.ensure_instructions_cell(self.instructions)
-                await self._append_message(SystemMessage(self.instructions), "system")
-            elif self.bridge is not None:
+            if self.bridge is not None and not sent_instructions:
                 system = next(
                     (message for message in self._messages if isinstance(message, SystemMessage)),
                     None,
@@ -152,31 +159,39 @@ class Session:
     def _ensure_loaded_sync(self) -> None:
         asyncio.run(self._ensure_loaded())
 
-    async def _save(self) -> None:
-        if self.conversation is None:
-            raise RuntimeError("conversation is not loaded")
-        await self.store.save(self.conversation.as_dict())
+    @staticmethod
+    async def _await_durable(operation: Awaitable[None]) -> None:
+        task = asyncio.create_task(operation)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _commit(self, append: Callable[[Conversation], dict[str, Any] | None]) -> None:
+        async def save_event() -> None:
+            async with self._write_lock:
+                if self.conversation is None:
+                    raise RuntimeError("conversation is not loaded")
+                event = append(self.conversation)
+                if event is None:
+                    return
+                try:
+                    self.conversation._validate_tool_history()
+                    await self.store.save(self.conversation.as_dict())
+                except BaseException:
+                    self.conversation.rollback(event)
+                    raise
+                if isinstance(event.get("message"), dict):
+                    self._messages.extend(messages_from_dict([event["message"]]))
+
+        await self._await_durable(save_event())
 
     async def _append_event(self, event_type: str, **data: Any) -> None:
-        if self.conversation is None:
-            raise RuntimeError("conversation is not loaded")
-        event = self.conversation.append(event_type, **data)
-        try:
-            await self._save()
-        except Exception:
-            self.conversation.rollback(event)
-            raise
+        await self._commit(lambda conversation: conversation.append(event_type, **data))
 
     async def _append_message(self, message: BaseMessage, turn_id: str) -> None:
-        if self.conversation is None:
-            raise RuntimeError("conversation is not loaded")
-        event = self.conversation.append_message(message, turn_id)
-        try:
-            await self._save()
-        except Exception:
-            self.conversation.rollback(event)
-            raise
-        self._messages.append(message)
+        await self._commit(lambda conversation: conversation.append_message(message, turn_id))
 
     async def _append_notebook(
         self,
@@ -185,17 +200,7 @@ class Session:
     ) -> None:
         if notebook is None:
             return
-        if self.conversation is None:
-            raise RuntimeError("conversation is not loaded")
-        event = self.conversation.append_notebook(notebook, turn_id)
-        if event is None:
-            return
-        try:
-            await self._save()
-        except Exception:
-            self.conversation.rollback(event)
-            raise
-        self._messages.extend(messages_from_dict([event["message"]]))
+        await self._commit(lambda conversation: conversation.append_notebook(notebook, turn_id))
 
     def _append_event_sync(self, event_type: str, **data: Any) -> None:
         asyncio.run(self._append_event(event_type, **data))
@@ -218,6 +223,12 @@ class Session:
         return {}
 
     @staticmethod
+    def _start_model_turn(model: BaseChatModel) -> None:
+        start = getattr(model, "start_turn", None)
+        if callable(start):
+            start()
+
+    @staticmethod
     def _ensure_tool_call_ids(response: AIMessage) -> list[str]:
         identifiers: list[str] = []
         for call in response.tool_calls:
@@ -237,12 +248,17 @@ class Session:
             status="error",
         )
 
-    async def _seal_interrupted_calls(self, identifiers: list[str], turn_id: str) -> None:
-        for identifier in identifiers:
+    def _pending_calls(self, turn_id: str) -> list[str]:
+        if self.conversation is None:
+            return []
+        return [identifier for identifier, _ in self.conversation.pending_tool_calls({turn_id})]
+
+    async def _seal_interrupted_calls(self, turn_id: str) -> None:
+        for identifier in self._pending_calls(turn_id):
             await self._append_message(self._interrupted_tool_message(identifier), turn_id)
 
-    def _seal_interrupted_calls_sync(self, identifiers: list[str], turn_id: str) -> None:
-        for identifier in identifiers:
+    def _seal_interrupted_calls_sync(self, turn_id: str) -> None:
+        for identifier in self._pending_calls(turn_id):
             self._append_message_sync(self._interrupted_tool_message(identifier), turn_id)
 
     def _update_assistant_stream(self, cell_id: str | None, text: str) -> str | None:
@@ -263,6 +279,39 @@ class Session:
     def _cancel_assistant_stream(self, cell_id: str | None) -> None:
         if cell_id is not None and self.bridge is not None:
             self.bridge.cancel_markdown_cell(cell_id)
+
+    async def _reset_model_connection(self, model: BaseChatModel) -> None:
+        close = getattr(model, "aclose", None)
+        if callable(close):
+            await close()
+
+    def _stream_with_retries(
+        self,
+        model: BaseChatModel,
+    ) -> tuple[AIMessage, str | None]:
+        for retry in range(len(_MODEL_RETRY_DELAYS) + 1):
+            try:
+                return self._stream_model(self._bind(model), model)
+            except TransientProviderError as error:
+                if retry == len(_MODEL_RETRY_DELAYS):
+                    raise
+                asyncio.run(self._reset_model_connection(model))
+                time.sleep(max(0.0, error.retry_after or _MODEL_RETRY_DELAYS[retry]))
+        raise AssertionError("unreachable")
+
+    async def _astream_with_retries(
+        self,
+        model: BaseChatModel,
+    ) -> tuple[AIMessage, str | None]:
+        for retry in range(len(_MODEL_RETRY_DELAYS) + 1):
+            try:
+                return await self._astream_model(self._bind(model), model)
+            except TransientProviderError as error:
+                if retry == len(_MODEL_RETRY_DELAYS):
+                    raise
+                await self._reset_model_connection(model)
+                await asyncio.sleep(max(0.0, error.retry_after or _MODEL_RETRY_DELAYS[retry]))
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _completed_stream_message(
@@ -294,9 +343,7 @@ class Session:
                 )
                 if isinstance(message, AIMessageChunk):
                     aggregate = (
-                        message
-                        if aggregate is None
-                        else add_ai_message_chunks(aggregate, message)
+                        message if aggregate is None else add_ai_message_chunks(aggregate, message)
                     )
                     current = message_chunk_to_message(aggregate)
                 elif isinstance(message, AIMessage) and aggregate is None and response is None:
@@ -333,9 +380,7 @@ class Session:
                 )
                 if isinstance(message, AIMessageChunk):
                     aggregate = (
-                        message
-                        if aggregate is None
-                        else add_ai_message_chunks(aggregate, message)
+                        message if aggregate is None else add_ai_message_chunks(aggregate, message)
                     )
                     current = message_chunk_to_message(aggregate)
                 elif isinstance(message, AIMessage) and aggregate is None and response is None:
@@ -366,12 +411,16 @@ class Session:
         raise RuntimeError("clear() cannot run inside an active event loop; use await aclear().")
 
     async def aclear(self) -> None:
-        self.conversation = Conversation()
-        self._messages.clear()
-        self.last_response = None
-        await self._save()
-        if self.instructions:
-            await self._append_message(SystemMessage(self.instructions), "system")
+        async def reset() -> None:
+            async with self._write_lock:
+                conversation = Conversation()
+                conversation.append_message(SystemMessage(self.instructions), "system")
+                await self.store.save(conversation.as_dict())
+                self.conversation = conversation
+                self._messages = conversation.messages()
+                self.last_response = None
+
+        await self._await_durable(reset())
 
     def send(
         self,
@@ -395,15 +444,14 @@ class Session:
         self._ensure_loaded_sync()
         turn_id = str(uuid4())
         self._append_event_sync("turn_started", turn_id=turn_id)
-        bound_model = self._bind(model)
-        pending_calls: list[str] = []
         assistant_cell_id: str | None = None
         try:
+            self._start_model_turn(model)
             self._append_notebook_sync(notebook, turn_id)
             self._append_message_sync(HumanMessage(text), turn_id)
             while True:
-                response, assistant_cell_id = self._stream_model(bound_model, model)
-                pending_calls = self._ensure_tool_call_ids(response)
+                response, assistant_cell_id = self._stream_with_retries(model)
+                identifiers = self._ensure_tool_call_ids(response)
                 self._append_message_sync(response, turn_id)
                 self.last_response = response
                 self._finish_assistant_stream(assistant_cell_id, response)
@@ -412,7 +460,7 @@ class Session:
                     self._append_event_sync("turn_finished", turn_id=turn_id, status="completed")
                     return
 
-                for call, identifier in zip(response.tool_calls, tuple(pending_calls), strict=True):
+                for call, identifier in zip(response.tool_calls, identifiers, strict=True):
                     report = self._execute_call(call)
                     self._append_message_sync(
                         ToolMessage(
@@ -421,15 +469,14 @@ class Session:
                         ),
                         turn_id,
                     )
-                    pending_calls.remove(identifier)
         except KeyboardInterrupt:
             self._cancel_assistant_stream(assistant_cell_id)
-            self._seal_interrupted_calls_sync(pending_calls, turn_id)
+            self._seal_interrupted_calls_sync(turn_id)
             self._append_event_sync("turn_finished", turn_id=turn_id, status="cancelled")
             raise
         except Exception:
             self._cancel_assistant_stream(assistant_cell_id)
-            self._seal_interrupted_calls_sync(pending_calls, turn_id)
+            self._seal_interrupted_calls_sync(turn_id)
             self._append_event_sync("turn_finished", turn_id=turn_id, status="failed")
             raise
 
@@ -448,15 +495,14 @@ class Session:
         await self._ensure_loaded()
         turn_id = str(uuid4())
         await self._append_event("turn_started", turn_id=turn_id)
-        bound_model = self._bind(model)
-        pending_calls: list[str] = []
         assistant_cell_id: str | None = None
         try:
+            self._start_model_turn(model)
             await self._append_notebook(notebook, turn_id)
             await self._append_message(HumanMessage(text), turn_id)
             while True:
-                response, assistant_cell_id = await self._astream_model(bound_model, model)
-                pending_calls = self._ensure_tool_call_ids(response)
+                response, assistant_cell_id = await self._astream_with_retries(model)
+                identifiers = self._ensure_tool_call_ids(response)
                 await self._append_message(response, turn_id)
                 self.last_response = response
                 self._finish_assistant_stream(assistant_cell_id, response)
@@ -465,7 +511,7 @@ class Session:
                     await self._append_event("turn_finished", turn_id=turn_id, status="completed")
                     return
 
-                for call, identifier in zip(response.tool_calls, tuple(pending_calls), strict=True):
+                for call, identifier in zip(response.tool_calls, identifiers, strict=True):
                     report = await self._aexecute_call(call)
                     await self._append_message(
                         ToolMessage(
@@ -474,17 +520,14 @@ class Session:
                         ),
                         turn_id,
                     )
-                    pending_calls.remove(identifier)
         except asyncio.CancelledError:
             self._cancel_assistant_stream(assistant_cell_id)
-            await asyncio.shield(self._seal_interrupted_calls(pending_calls, turn_id))
-            await asyncio.shield(
-                self._append_event("turn_finished", turn_id=turn_id, status="cancelled")
-            )
+            await self._seal_interrupted_calls(turn_id)
+            await self._append_event("turn_finished", turn_id=turn_id, status="cancelled")
             raise
         except Exception:
             self._cancel_assistant_stream(assistant_cell_id)
-            await self._seal_interrupted_calls(pending_calls, turn_id)
+            await self._seal_interrupted_calls(turn_id)
             await self._append_event("turn_finished", turn_id=turn_id, status="failed")
             raise
 

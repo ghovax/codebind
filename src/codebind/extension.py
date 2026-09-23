@@ -17,16 +17,26 @@ from .session import Session
 _STATE_ATTRIBUTE = "_codebind_extension_state"
 
 
+def _close_state(state: dict[str, Any]) -> None:
+    load_task = state.get("load_task")
+    if isinstance(load_task, asyncio.Task):
+        load_task.cancel()
+    session = state.get("session")
+    if isinstance(session, Session) and session.bridge is not None:
+        session.bridge.close()
+    discard_model = state.get("discard_model")
+    if callable(discard_model):
+        try:
+            asyncio.get_running_loop().create_task(discard_model())
+        except RuntimeError:
+            asyncio.run(discard_model())
+
+
 def load_ipython_extension(ipython: InteractiveShell) -> None:
     """Load Codebind into the active IPython session."""
     previous = getattr(ipython, _STATE_ATTRIBUTE, None)
     if isinstance(previous, dict):
-        previous_load = previous.get("load_task")
-        if isinstance(previous_load, asyncio.Task):
-            previous_load.cancel()
-        previous_session = previous.get("session")
-        if isinstance(previous_session, Session) and previous_session.bridge is not None:
-            previous_session.bridge.close()
+        _close_state(previous)
 
     configuration = load_configuration()
     models = load_models()
@@ -38,10 +48,16 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             model = models.chat(configuration.model, **configuration.parameters)
         return model
 
-    def discard_model(selected: BaseChatModel) -> None:
+    async def discard_model() -> None:
         nonlocal model
-        if model is selected:
-            model = None
+        selected = model
+        model = None
+        close = getattr(selected, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
 
     bridge = JupyterLabBridge.connect(ipython)
     store = NotebookConversationStore(bridge) if bridge is not None else MemoryConversationStore()
@@ -52,7 +68,7 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
         try:
             await session.asend(question, selected, notebook=notebook)
         except BaseException:
-            discard_model(selected)
+            await discard_model()
             raise
 
     def question_magic(line: str, cell: str | None = None) -> None:
@@ -60,7 +76,7 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
         try:
             session.send(cell if cell is not None else line, selected)
         except BaseException:
-            discard_model(selected)
+            asyncio.run(discard_model())
             raise
 
     load_task: asyncio.Task[None] | None = None
@@ -90,6 +106,7 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             "bridge": bridge,
             "load_task": load_task,
             "get_model": get_model,
+            "discard_model": discard_model,
         },
     )
 
@@ -98,12 +115,7 @@ def unload_ipython_extension(ipython: InteractiveShell) -> None:
     """Unload Codebind without touching the user namespace."""
     state: Any = getattr(ipython, _STATE_ATTRIBUTE, None)
     if isinstance(state, dict):
-        load_task = state.get("load_task")
-        if isinstance(load_task, asyncio.Task):
-            load_task.cancel()
-        session = state.get("session")
-        if isinstance(session, Session) and session.bridge is not None:
-            session.bridge.close()
+        _close_state(state)
         delattr(ipython, _STATE_ATTRIBUTE)
     ipython.magics_manager.magics["line"].pop("question", None)
     ipython.magics_manager.magics["cell"].pop("question", None)

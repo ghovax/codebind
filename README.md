@@ -74,6 +74,8 @@ The whole notebook is model context. Before each Question, Codebind takes a cano
 
 Codebind stores the complete LangChain message, notebook-context, and turn ledger in notebook metadata. Reopening the notebook, restarting its kernel, and loading the extension restores the exact accumulated context automatically. Each assistant Markdown segment is buffered and inserted as one complete native cell as soon as that segment finishes, before a following tool call is complete. Tool executions and assistant answers are always appended to the notebook end without changing the user's current selection or scroll position. Tool outputs are collapsed by default and remain expandable through JupyterLab's native output control.
 
+The conversation ledger validates its structure and every assistant tool call against its single matching result, without a version gate. Interrupted saves finish before a turn is cancelled, so a restart cannot turn a partial write into an orphan tool result. Temporary model transport failures retry the same Question with a fresh connection; repeated WebSocket failures use HTTP. Invalid requests and authentication failures remain visible errors.
+
 An interrupted tool call is closed with an explicit interrupted result before the turn ends. If a provider stream is cancelled or fails, Codebind discards that provider session before the next Question while retaining the notebook conversation and its stable prompt-cache identity.
 
 The instruction cell, sent Question cells, model-authored tool cells, and assistant Markdown cells are non-editable and non-deletable. Draft Question cells remain editable until they are sent. Jupyter's standard interrupt button cancels an active Codebind question.

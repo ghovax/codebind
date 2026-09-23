@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
     "ipython>=9.0",
     "langchain-core>=1.0",
-    "models-provider>=0.1.1",
+    "models-provider>=0.1.2",
 ]
 
 [project.urls]
