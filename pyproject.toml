@@ -1,6 +1,6 @@
 [project]
 name = "codebind"
-version = "0.6.4"
+version = "0.6.5"
 description = "A frontend-neutral model loop for persistent IPython sessions."
 readme = "README.md"
 authors = [
@@ -21,11 +21,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "ipython>=9.0",
+    "ipython>=9.17",
     "langchain-core>=1.0",
     "models-provider>=0.1.2",
     "pillow>=11",
     "resvg-py>=0.5",
+    "rich>=14.1",
 ]
 
 [project.urls]

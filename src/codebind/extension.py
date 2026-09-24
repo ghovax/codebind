@@ -6,18 +6,23 @@ import asyncio
 from typing import Any
 
 from IPython.core.interactiveshell import InteractiveShell
+from IPython.terminal.interactiveshell import TerminalInteractiveShell
 from langchain_core.language_models import BaseChatModel
 
 from .configuration import load_configuration, load_models
 from .conversation import MemoryConversationStore, NotebookConversationStore
 from .jupyter import JupyterLabBridge, TARGET_NAME
 from .session import Session
+from .terminal import install_markdown_renderer
 
 
 _STATE_ATTRIBUTE = "_codebind_extension_state"
 
 
 def _close_state(state: dict[str, Any]) -> None:
+    restore_terminal_display = state.get("restore_terminal_display")
+    if callable(restore_terminal_display):
+        restore_terminal_display()
     manager = state.get("comm_manager")
     target = state.get("comm_target")
     if manager is not None and getattr(manager, "targets", {}).get(TARGET_NAME) is target:
@@ -72,10 +77,13 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
         "discard_model": discard_model,
         "comm_manager": manager,
         "comm_target": None,
+        "restore_terminal_display": None,
     }
 
     if manager is None:
         state["session"] = Session(shell=ipython, store=MemoryConversationStore())
+        if isinstance(ipython, TerminalInteractiveShell):
+            state["restore_terminal_display"] = install_markdown_renderer(ipython)
     else:
 
         def accept_comm(comm: Any, message: dict[str, Any]) -> None:

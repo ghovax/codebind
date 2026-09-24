@@ -10,11 +10,13 @@ from typing import Any, cast
 
 from IPython.core.displaypub import DisplayPublisher
 from IPython.core.interactiveshell import InteractiveShell
+from IPython.terminal.interactiveshell import TerminalInteractiveShell
 from IPython.utils.capture import capture_output
 
 from .display import display_cell
 from .images import PreparedImage, prepare_mime_image
 from .jupyter import JupyterLabBridge
+from .terminal import record_tool_output, show_input
 
 
 _MAXIMUM_IMAGES_PER_REPORT = 32
@@ -215,6 +217,12 @@ class IPythonExecutor:
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError("cell must be a non-empty string")
 
+        if self.bridge is None and isinstance(self.shell, TerminalInteractiveShell):
+            show_input(self.shell, cell)
+            with record_tool_output(self.shell):
+                result = self.shell.run_cell(cell, store_history=True)
+            return self._native_report(result)
+
         bridge = self.bridge
         cell_id = bridge.start_code_cell(cell) if bridge is not None else None
         bridged = cell_id is not None
@@ -246,6 +254,26 @@ class IPythonExecutor:
         """Execute an async-capable cell and replay its native rich output."""
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError("cell must be a non-empty string")
+
+        if self.bridge is None and isinstance(self.shell, TerminalInteractiveShell):
+            show_input(self.shell, cell)
+            transformed = self.shell.transform_cell(cell)
+            result = None
+            with (
+                record_tool_output(self.shell),
+                self.shell._tee(channel="stdout"),
+                self.shell._tee(channel="stderr"),
+            ):
+                try:
+                    result = await self.shell.run_cell_async(
+                        cell,
+                        store_history=True,
+                        transformed_cell=transformed,
+                    )
+                finally:
+                    self.shell.events.trigger("post_execute")
+                    self.shell.events.trigger("post_run_cell", result)
+            return self._native_report(result)
 
         bridge = self.bridge
         cell_id = bridge.start_code_cell(cell) if bridge is not None else None
@@ -304,17 +332,41 @@ class IPythonExecutor:
         captured: Any,
         expression_outputs: list[dict[str, Any]],
     ) -> ExecutionReport:
-        """Build the model-facing text and image projection of an IPython execution."""
-
-        displays: list[str] = []
-        images: list[PreparedImage] = []
-        omissions: list[str] = []
+        """Build a report from a captured notebook or alternate frontend cell."""
         bundles = [getattr(output, "data", None) for output in captured.outputs]
         bundles.extend(output.get("data") for output in expression_outputs)
         if not expression_outputs and result.result is not None:
             data, _ = self.shell.display_formatter.format(result.result)
             if any(key.startswith("image/") for key in data):
                 bundles.append(data)
+        return self._assemble_report(result, captured.stdout, captured.stderr, bundles)
+
+    def _native_report(self, result: Any) -> ExecutionReport:
+        """Read the exact output IPython recorded for a terminal execution."""
+        records = self.shell.history_manager.outputs.get(result.execution_count, ())
+        stdout: list[str] = []
+        stderr: list[str] = []
+        bundles: list[dict[str, Any]] = []
+        for record in records:
+            if record.output_type == "out_stream":
+                stdout.extend(record.bundle["stream"])
+            elif record.output_type == "err_stream":
+                stderr.extend(record.bundle["stream"])
+            elif record.output_type in {"display_data", "execute_result"}:
+                bundles.append(record.bundle)
+        return self._assemble_report(result, "".join(stdout), "".join(stderr), bundles)
+
+    @staticmethod
+    def _assemble_report(
+        result: Any,
+        stdout: str,
+        stderr: str,
+        bundles: list[Any],
+    ) -> ExecutionReport:
+        """Build the model-facing text and image projection of an IPython execution."""
+        displays: list[str] = []
+        images: list[PreparedImage] = []
+        omissions: list[str] = []
         for index, data in enumerate(bundles):
             if isinstance(data, dict) and "text/plain" in data:
                 displays.append(str(data["text/plain"]))
@@ -340,8 +392,8 @@ class IPythonExecutor:
         )
         return ExecutionReport(
             ok=result.success,
-            stdout=captured.stdout,
-            stderr=captured.stderr,
+            stdout=stdout,
+            stderr=stderr,
             result=repr(result.result) if result.result is not None else None,
             displays=tuple(displays),
             error=error,

@@ -45,6 +45,7 @@ Inspect this project and tell me what to implement first.
 ```
 
 Terminal conversations remain live for the current IPython process. Durable automatic resumption belongs to notebooks, where the notebook file provides an unambiguous conversation identity.
+Model-executed cells appear with IPython's native input counter, syntax highlighting, output prompts, streams, and tracebacks. Assistant Markdown is rendered through IPython's terminal MIME renderer. A terminal is a stream rather than a notebook document, so these displays are not editable notebook cells.
 
 ## JupyterLab
 
