@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import shutil
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -23,7 +22,8 @@ from rich.markdown import Markdown
 
 _MISSING = object()
 _IMAGE_FORMATS = ("image/png", "image/jpeg", "image/svg+xml")
-_MAXIMUM_VISIBLE_OUTPUT_LINES = 10
+_MAXIMUM_VISIBLE_OUTPUT_LINES = 3
+_MAXIMUM_VISIBLE_OUTPUT_CHARACTERS_PER_LINE = 80
 
 
 def _plain_ansi(value: str) -> str:
@@ -192,66 +192,80 @@ class TerminalCellHistory:
 class _OutputPreview:
     """Limit only terminal painting; IPython still records every written byte."""
 
-    def __init__(self, maximum_lines: int, maximum_characters: int) -> None:
+    def __init__(self, maximum_lines: int, maximum_characters_per_line: int) -> None:
         self.maximum_lines = maximum_lines
-        self.maximum_characters = maximum_characters
+        self.maximum_characters_per_line = maximum_characters_per_line
         self.visible_lines = 0
+        self.characters_on_line = 0
+        self.line_truncated = False
         self.visible_characters = 0
         self.hidden_line_breaks = 0
         self.hidden_has_tail = False
         self.hidden_characters = 0
-        self.truncated = False
         self.visible_ends_line = True
 
     def _hide(self, data: str) -> None:
-        self.truncated = True
         self.hidden_characters += len(data)
         self.hidden_line_breaks += data.count("\n") + data.count("\r") - data.count("\r\n")
         self.hidden_has_tail = not data.endswith(("\n", "\r"))
 
+    def _paint(self, stream, text: str) -> None:
+        if not text:
+            return
+        if stream.isatty():
+            stream.write("\x1b[90m")
+        stream.write(text)
+        if stream.isatty():
+            stream.write("\x1b[0m")
+        self.visible_characters += len(text)
+
     def write(self, stream, data: str) -> int:
         for piece in data.splitlines(keepends=True):
-            remaining = self.maximum_characters - self.visible_characters
-            if self.truncated or self.visible_lines >= self.maximum_lines or remaining <= 0:
+            if self.visible_lines >= self.maximum_lines:
                 self._hide(piece)
                 continue
-            visible = piece[:remaining]
-            if len(visible) < len(piece) and "\x1b" in visible:
-                # Never leave a partially printed ANSI escape sequence on screen.
-                visible = ""
+
+            if piece.endswith("\r\n"):
+                body, ending = piece[:-2], "\r\n"
+            elif piece.endswith(("\n", "\r")):
+                body, ending = piece[:-1], piece[-1]
+            else:
+                body, ending = piece, ""
+
+            visible = ""
+            if not self.line_truncated:
+                remaining = self.maximum_characters_per_line - self.characters_on_line
+                visible = body[:remaining]
+                self.characters_on_line += len(visible)
+                if len(body) > remaining:
+                    visible += "…"
+                    self.line_truncated = True
+            if ending:
+                visible += ending
+                self.visible_lines += 1
+                self.characters_on_line = 0
+                self.line_truncated = False
             if visible:
-                if stream.isatty():
-                    stream.write("\x1b[90m")
-                stream.write(visible)
-                if stream.isatty():
-                    stream.write("\x1b[0m")
-                self.visible_characters += len(visible)
-                self.visible_ends_line = visible.endswith(("\n", "\r"))
-                if self.visible_ends_line:
-                    self.visible_lines += 1
-            if len(visible) < len(piece):
-                self._hide(piece[len(visible) :])
+                self._paint(stream, visible)
+                self.visible_ends_line = bool(ending)
         return len(data)
 
-    def show_notice(self, number: int, error: dict[str, str] | None = None) -> None:
+    def show_notice(self, error: dict[str, str] | None = None) -> None:
         if self.visible_characters and not self.visible_ends_line:
             sys.stdout.write("\n")
             self.visible_ends_line = True
         if not self.hidden_characters:
             return
-        if sys.stdout.isatty():
-            sys.stdout.write("\x1b[0m")
+        terminal = sys.stdout.isatty()
+        if terminal:
+            sys.stdout.write("\x1b[90m")
         hidden_lines = self.hidden_line_breaks + int(self.hidden_has_tail)
         label = "line" if hidden_lines == 1 else "lines"
-        sys.stdout.write(
-            f"… {hidden_lines:,} more output {label}. Run %output {number} to view all.\n"
-        )
+        sys.stdout.write(f"… {hidden_lines:,} more output {label}\n")
         if error is not None:
-            if sys.stdout.isatty():
-                sys.stdout.write("\x1b[90m")
             sys.stdout.write(f"{error['type']}: {error['message']}\n")
-            if sys.stdout.isatty():
-                sys.stdout.write("\x1b[0m")
+        if terminal:
+            sys.stdout.write("\x1b[0m")
 
 
 class _PreviewStream:
@@ -276,10 +290,10 @@ class _PreviewStream:
 @contextmanager
 def preview_tool_output(
     maximum_lines: int = _MAXIMUM_VISIBLE_OUTPUT_LINES,
+    maximum_characters_per_line: int = _MAXIMUM_VISIBLE_OUTPUT_CHARACTERS_PER_LINE,
 ) -> Iterator[_OutputPreview]:
     """Show a compact preview while keeping the tool cell's complete native output."""
-    columns = shutil.get_terminal_size(fallback=(80, 24)).columns
-    preview = _OutputPreview(maximum_lines, maximum_lines * max(20, columns))
+    preview = _OutputPreview(maximum_lines, maximum_characters_per_line)
     stdout, stderr = sys.stdout, sys.stderr
     preview_stdout = _PreviewStream(stdout, preview)
     preview_stderr = _PreviewStream(stderr, preview)
@@ -395,7 +409,6 @@ def show_input(shell: TerminalInteractiveShell, cell: str) -> None:
             style=style,
             color_depth=shell.color_depth,
         )
-    sys.stdout.write("\n")
 
 
 def install_markdown_renderer(shell: TerminalInteractiveShell) -> Callable[[], None]:

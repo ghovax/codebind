@@ -222,7 +222,7 @@ class IPythonExecutor:
             with preview_tool_output() as preview, record_tool_output(self.shell):
                 result = self.shell.run_cell(cell, store_history=True)
             report = self._native_report(result)
-            preview.show_notice(result.execution_count, report.error)
+            preview.show_notice(report.error)
             return report
 
         bridge = self.bridge
@@ -277,7 +277,7 @@ class IPythonExecutor:
                     self.shell.events.trigger("post_execute")
                     self.shell.events.trigger("post_run_cell", result)
             report = self._native_report(result)
-            preview.show_notice(result.execution_count, report.error)
+            preview.show_notice(report.error)
             return report
 
         bridge = self.bridge
