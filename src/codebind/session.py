@@ -274,8 +274,24 @@ class Session:
         for identifier in self._pending_calls(turn_id):
             self._append_message_sync(self._interrupted_tool_message(identifier), turn_id)
 
-    def _update_assistant_stream(self, cell_id: str | None, text: str) -> str | None:
-        if self.bridge is None or not text:
+    def _update_assistant_stream(
+        self,
+        cell_id: str | None,
+        text: str,
+        shown: str,
+        terminal_displayed: list[str] | None = None,
+    ) -> str | None:
+        if not text:
+            return cell_id
+        if self.bridge is None:
+            previous = terminal_displayed[0] if terminal_displayed is not None else shown
+            if previous.startswith(text):
+                return cell_id
+            addition = text[len(previous) :] if text.startswith(previous) else text
+            if addition:
+                self._display_assistant(addition)
+            if terminal_displayed is not None:
+                terminal_displayed[0] = text
             return cell_id
         if cell_id is None:
             return self.bridge.start_markdown_cell(text)
@@ -284,7 +300,9 @@ class Session:
 
     def _finish_assistant_stream(self, cell_id: str | None, response: AIMessage) -> None:
         answer = _message_text(response)
-        if cell_id is not None and self.bridge is not None:
+        if self.bridge is None:
+            return
+        if cell_id is not None:
             self.bridge.finish_markdown_cell(cell_id, answer)
         elif answer:
             self._display_assistant(answer)
@@ -302,9 +320,10 @@ class Session:
         self,
         model: BaseChatModel,
     ) -> tuple[AIMessage, str | None]:
+        terminal_displayed = [""]
         for retry in range(len(_MODEL_RETRY_DELAYS) + 1):
             try:
-                return self._stream_model(self._bind(model), model)
+                return self._stream_model(self._bind(model), model, terminal_displayed)
             except TransientProviderError as error:
                 if retry == len(_MODEL_RETRY_DELAYS):
                     raise
@@ -316,9 +335,10 @@ class Session:
         self,
         model: BaseChatModel,
     ) -> tuple[AIMessage, str | None]:
+        terminal_displayed = [""]
         for retry in range(len(_MODEL_RETRY_DELAYS) + 1):
             try:
-                return await self._astream_model(self._bind(model), model)
+                return await self._astream_model(self._bind(model), model, terminal_displayed)
             except TransientProviderError as error:
                 if retry == len(_MODEL_RETRY_DELAYS):
                     raise
@@ -344,6 +364,7 @@ class Session:
         self,
         bound_model: Runnable[Any, BaseMessage],
         model: BaseChatModel,
+        terminal_displayed: list[str] | None = None,
     ) -> tuple[AIMessage, str | None]:
         aggregate: AIMessageChunk | None = None
         response: AIMessage | None = None
@@ -366,12 +387,14 @@ class Session:
                     raise TypeError("model stream must return AIMessage chunks")
                 text = _message_text(current)
                 if tool_call_started and text != shown:
-                    cell_id = self._update_assistant_stream(cell_id, text)
+                    cell_id = self._update_assistant_stream(
+                        cell_id, text, shown, terminal_displayed
+                    )
                     shown = text
             completed = self._completed_stream_message(aggregate, response)
             answer = _message_text(completed)
             if answer != shown:
-                cell_id = self._update_assistant_stream(cell_id, answer)
+                cell_id = self._update_assistant_stream(cell_id, answer, shown, terminal_displayed)
             return completed, cell_id
         except BaseException:
             self._cancel_assistant_stream(cell_id)
@@ -381,6 +404,7 @@ class Session:
         self,
         bound_model: Runnable[Any, BaseMessage],
         model: BaseChatModel,
+        terminal_displayed: list[str] | None = None,
     ) -> tuple[AIMessage, str | None]:
         aggregate: AIMessageChunk | None = None
         response: AIMessage | None = None
@@ -403,12 +427,14 @@ class Session:
                     raise TypeError("model stream must return AIMessage chunks")
                 text = _message_text(current)
                 if tool_call_started and text != shown:
-                    cell_id = self._update_assistant_stream(cell_id, text)
+                    cell_id = self._update_assistant_stream(
+                        cell_id, text, shown, terminal_displayed
+                    )
                     shown = text
             completed = self._completed_stream_message(aggregate, response)
             answer = _message_text(completed)
             if answer != shown:
-                cell_id = self._update_assistant_stream(cell_id, answer)
+                cell_id = self._update_assistant_stream(cell_id, answer, shown, terminal_displayed)
             return completed, cell_id
         except BaseException:
             self._cancel_assistant_stream(cell_id)

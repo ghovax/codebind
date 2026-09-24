@@ -307,7 +307,7 @@ wheels = [
 
 [[package]]
 name = "codebind"
-version = "0.6.8"
+version = "0.6.9"
 source = { editable = "." }
 dependencies = [
     { name = "ipython" },

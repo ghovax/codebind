@@ -30,6 +30,20 @@ def _plain_ansi(value: str) -> str:
     return "".join(text for _, text in to_formatted_text(ANSI(value)))
 
 
+def _split_incomplete_ansi(value: str) -> tuple[str, str]:
+    last_escape = value.rfind("\x1b")
+    if last_escape < 0:
+        return value, ""
+    tail = value[last_escape:]
+    if tail == "\x1b":
+        return value[:last_escape], tail
+    if tail.startswith("\x1b[") and not any("@" <= char <= "~" for char in tail[2:]):
+        return value[:last_escape], tail
+    if tail.startswith("\x1b]") and "\x07" not in tail and "\x1b\\" not in tail:
+        return value[:last_escape], tail
+    return value, ""
+
+
 def _magic_input(transformed: str) -> tuple[str, str] | None:
     """Recognize a complete IPython magic call in transformed history."""
     try:
@@ -220,12 +234,13 @@ class _OutputPreview:
         return len(data)
 
     def show_notice(self, number: int, error: dict[str, str] | None = None) -> None:
+        if self.visible_characters and not self.visible_ends_line:
+            sys.stdout.write("\n")
+            self.visible_ends_line = True
         if not self.hidden_characters:
             return
         if sys.stdout.isatty():
             sys.stdout.write("\x1b[0m")
-        if not self.visible_ends_line:
-            sys.stdout.write("\n")
         hidden_lines = self.hidden_line_breaks + int(self.hidden_has_tail)
         label = "line" if hidden_lines == 1 else "lines"
         sys.stdout.write(
@@ -246,20 +261,12 @@ class _PreviewStream:
         self.pending = ""
 
     def write(self, data: str) -> int:
-        self.pending += data
-        lines = self.pending.splitlines(keepends=True)
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            self.pending = lines.pop()
-        else:
-            self.pending = ""
-        for line in lines:
-            self.preview.write(self.stream, _plain_ansi(line))
+        complete, self.pending = _split_incomplete_ansi(self.pending + data)
+        if complete:
+            self.preview.write(self.stream, _plain_ansi(complete))
         return len(data)
 
     def flush(self) -> None:
-        if self.pending:
-            self.preview.write(self.stream, _plain_ansi(self.pending))
-            self.pending = ""
         self.stream.flush()
 
     def __getattr__(self, name: str):
@@ -388,6 +395,7 @@ def show_input(shell: TerminalInteractiveShell, cell: str) -> None:
             style=style,
             color_depth=shell.color_depth,
         )
+    sys.stdout.write("\n")
 
 
 def install_markdown_renderer(shell: TerminalInteractiveShell) -> Callable[[], None]:
@@ -399,6 +407,7 @@ def install_markdown_renderer(shell: TerminalInteractiveShell) -> Callable[[], N
     previous_renderer = shell.mime_renderers.get(mime, _MISSING)
 
     def render(text: str, _metadata: object) -> None:
+        sys.stdout.write("\n")
         Console(file=sys.stdout, soft_wrap=True, no_color=shell.colors.lower() == "nocolor").print(
             Markdown(text)
         )
