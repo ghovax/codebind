@@ -37,14 +37,16 @@ Start a new conversation:
 uvx codebind
 ```
 
-Ask through ordinary IPython magic syntax:
+Press `Shift+Tab` to switch the prompt into Question mode; the prompt turns purple. Type a question and press `Enter` to send it. Press `Shift+Tab` again to return to Python mode. Ordinary `Tab` completion is unchanged.
+
+The `%question` and `%%question` magics remain available:
 
 ```python
 %%question
 Inspect this project and tell me what to implement first.
 ```
 
-Terminal conversations remain live for the current IPython process. Durable automatic resumption belongs to notebooks, where the notebook file provides an unambiguous conversation identity.
+Terminal conversations remain live for the current IPython process. Previous terminal inputs and outputs, including Python cells you ran yourself, enter the model's context when you ask a question. Durable automatic resumption belongs to notebooks, where the notebook file provides an unambiguous conversation identity.
 Model-executed cells appear with IPython's native input counter, syntax highlighting, output prompts, streams, and tracebacks. Assistant Markdown is rendered through IPython's terminal MIME renderer. A terminal is a stream rather than a notebook document, so these displays are not editable notebook cells.
 
 ## JupyterLab

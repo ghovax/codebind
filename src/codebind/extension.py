@@ -13,13 +13,19 @@ from .configuration import load_configuration, load_models
 from .conversation import MemoryConversationStore, NotebookConversationStore
 from .jupyter import JupyterLabBridge, TARGET_NAME
 from .session import Session
-from .terminal import install_markdown_renderer
+from .terminal import TerminalCellHistory, install_markdown_renderer, install_question_mode
 
 
 _STATE_ATTRIBUTE = "_codebind_extension_state"
 
 
 def _close_state(state: dict[str, Any]) -> None:
+    terminal_history = state.get("terminal_history")
+    if isinstance(terminal_history, TerminalCellHistory):
+        terminal_history.close()
+    restore_terminal_question_mode = state.get("restore_terminal_question_mode")
+    if callable(restore_terminal_question_mode):
+        restore_terminal_question_mode()
     restore_terminal_display = state.get("restore_terminal_display")
     if callable(restore_terminal_display):
         restore_terminal_display()
@@ -44,6 +50,9 @@ def _close_state(state: dict[str, Any]) -> None:
 def load_ipython_extension(ipython: InteractiveShell) -> None:
     """Load Codebind into the active IPython session."""
     previous = getattr(ipython, _STATE_ATTRIBUTE, None)
+    previous_terminal_history = (
+        previous.get("terminal_history") if isinstance(previous, dict) else None
+    )
     if isinstance(previous, dict):
         _close_state(previous)
 
@@ -78,12 +87,23 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
         "comm_manager": manager,
         "comm_target": None,
         "restore_terminal_display": None,
+        "restore_terminal_question_mode": None,
+        "terminal_history": None,
     }
 
     if manager is None:
         state["session"] = Session(shell=ipython, store=MemoryConversationStore())
         if isinstance(ipython, TerminalInteractiveShell):
+            state["terminal_history"] = TerminalCellHistory(
+                ipython,
+                previous=(
+                    previous_terminal_history
+                    if isinstance(previous_terminal_history, TerminalCellHistory)
+                    else None
+                ),
+            )
             state["restore_terminal_display"] = install_markdown_renderer(ipython)
+            state["restore_terminal_question_mode"] = install_question_mode(ipython)
     else:
 
         def accept_comm(comm: Any, message: dict[str, Any]) -> None:
@@ -142,8 +162,14 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             session = Session(shell=ipython, store=MemoryConversationStore())
             state["session"] = session
         selected = get_model()
+        terminal_history = state.get("terminal_history")
+        history = (
+            terminal_history.snapshot()
+            if isinstance(terminal_history, TerminalCellHistory)
+            else None
+        )
         try:
-            session.send(cell if cell is not None else line, selected)
+            session.send(cell if cell is not None else line, selected, notebook=history)
         except BaseException:
             asyncio.run(discard_model())
             raise
