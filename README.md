@@ -47,7 +47,7 @@ Inspect this project and tell me what to implement first.
 ```
 
 Terminal conversations remain live for the current IPython process. Previous terminal inputs and outputs, including Python cells you ran yourself, enter the model's context when you ask a question. Durable automatic resumption belongs to notebooks, where the notebook file provides an unambiguous conversation identity.
-Model-executed cells appear with IPython's native input counter, syntax highlighting, output prompts, streams, and tracebacks. Assistant Markdown is rendered through IPython's terminal MIME renderer. A terminal is a stream rather than a notebook document, so these displays are not editable notebook cells.
+Model-executed cells appear with IPython's native input counter, syntax highlighting, output prompts, streams, and tracebacks. To keep terminal scrollback usable, Codebind shows at most 10 gray lines of each model-executed cell's output, then displays a notice such as `… 990 more output lines. Run %output 8 to view all.` The complete output remains available to the model and in IPython history; `%output 8` opens its full text in IPython's pager. User-entered Python cells keep IPython's normal display behavior. Assistant Markdown is rendered through IPython's terminal MIME renderer. A terminal is a stream rather than a notebook document, so these displays are not editable notebook cells.
 
 ## JupyterLab
 

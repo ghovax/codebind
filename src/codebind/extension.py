@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any
 
 from IPython.core.interactiveshell import InteractiveShell
+from IPython.core.page import page
 from IPython.terminal.interactiveshell import TerminalInteractiveShell
 from langchain_core.language_models import BaseChatModel
 
@@ -20,6 +22,9 @@ _STATE_ATTRIBUTE = "_codebind_extension_state"
 
 
 def _close_state(state: dict[str, Any]) -> None:
+    restore_output_magic = state.get("restore_output_magic")
+    if callable(restore_output_magic):
+        restore_output_magic()
     terminal_history = state.get("terminal_history")
     if isinstance(terminal_history, TerminalCellHistory):
         terminal_history.close()
@@ -89,6 +94,7 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
         "restore_terminal_display": None,
         "restore_terminal_question_mode": None,
         "terminal_history": None,
+        "restore_output_magic": None,
     }
 
     if manager is None:
@@ -104,6 +110,37 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
             )
             state["restore_terminal_display"] = install_markdown_renderer(ipython)
             state["restore_terminal_question_mode"] = install_question_mode(ipython)
+
+            line_magics = ipython.magics_manager.magics["line"]
+            previous_output_magic = line_magics.get("output")
+
+            def output_magic(line: str) -> None:
+                number_text = line.strip()
+                if not number_text.isdecimal() or int(number_text) < 1:
+                    raise ValueError("Usage: %output <cell number>")
+                terminal_history = state["terminal_history"]
+                if not isinstance(terminal_history, TerminalCellHistory):
+                    raise RuntimeError("Terminal history is unavailable")
+                number = int(number_text)
+                try:
+                    full_output = terminal_history.output_text(number)
+                except KeyError as error:
+                    raise ValueError(f"No recorded cell In [{number}]") from error
+                if full_output:
+                    page(f"\x1b[90m{full_output}\x1b[0m" if sys.stdout.isatty() else full_output)
+                else:
+                    print(f"In [{number}] has no text output.")
+
+            ipython.register_magic_function(output_magic, "line", "output")
+
+            def restore_output_magic() -> None:
+                if line_magics.get("output") is output_magic:
+                    if previous_output_magic is None:
+                        line_magics.pop("output", None)
+                    else:
+                        line_magics["output"] = previous_output_magic
+
+            state["restore_output_magic"] = restore_output_magic
     else:
 
         def accept_comm(comm: Any, message: dict[str, Any]) -> None:

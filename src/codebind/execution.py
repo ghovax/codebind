@@ -16,7 +16,7 @@ from IPython.utils.capture import capture_output
 from .display import display_cell
 from .images import PreparedImage, prepare_mime_image
 from .jupyter import JupyterLabBridge
-from .terminal import record_tool_output, show_input
+from .terminal import preview_tool_output, record_tool_output, show_input
 
 
 _MAXIMUM_IMAGES_PER_REPORT = 32
@@ -219,9 +219,11 @@ class IPythonExecutor:
 
         if self.bridge is None and isinstance(self.shell, TerminalInteractiveShell):
             show_input(self.shell, cell)
-            with record_tool_output(self.shell):
+            with preview_tool_output() as preview, record_tool_output(self.shell):
                 result = self.shell.run_cell(cell, store_history=True)
-            return self._native_report(result)
+            report = self._native_report(result)
+            preview.show_notice(result.execution_count, report.error)
+            return report
 
         bridge = self.bridge
         cell_id = bridge.start_code_cell(cell) if bridge is not None else None
@@ -260,6 +262,7 @@ class IPythonExecutor:
             transformed = self.shell.transform_cell(cell)
             result = None
             with (
+                preview_tool_output() as preview,
                 record_tool_output(self.shell),
                 self.shell._tee(channel="stdout"),
                 self.shell._tee(channel="stderr"),
@@ -273,7 +276,9 @@ class IPythonExecutor:
                 finally:
                     self.shell.events.trigger("post_execute")
                     self.shell.events.trigger("post_run_cell", result)
-            return self._native_report(result)
+            report = self._native_report(result)
+            preview.show_notice(result.execution_count, report.error)
+            return report
 
         bridge = self.bridge
         cell_id = bridge.start_code_cell(cell) if bridge is not None else None

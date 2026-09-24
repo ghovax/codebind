@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import shutil
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -13,7 +14,7 @@ from IPython.terminal.interactiveshell import IPythonPTLexer, TerminalInteractiv
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
+from prompt_toolkit.formatted_text import ANSI, FormattedText, PygmentsTokens, to_formatted_text
 from prompt_toolkit.shortcuts import print_formatted_text
 from prompt_toolkit.styles import DynamicStyle, Style, merge_styles
 from rich.console import Console
@@ -22,10 +23,15 @@ from rich.markdown import Markdown
 
 _MISSING = object()
 _IMAGE_FORMATS = ("image/png", "image/jpeg", "image/svg+xml")
+_MAXIMUM_VISIBLE_OUTPUT_LINES = 10
 
 
-def _question_text(transformed: str) -> str | None:
-    """Recover a Codebind question from IPython's own transformed history."""
+def _plain_ansi(value: str) -> str:
+    return "".join(text for _, text in to_formatted_text(ANSI(value)))
+
+
+def _magic_input(transformed: str) -> tuple[str, str] | None:
+    """Recognize a complete IPython magic call in transformed history."""
     try:
         statements = ast.parse(transformed).body
     except SyntaxError:
@@ -42,14 +48,14 @@ def _question_text(transformed: str) -> str | None:
         and call.func.value.func.id == "get_ipython"
         and bool(call.args)
         and isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == "question"
+        and isinstance(call.args[0].value, str)
     ):
         return None
     text_index = 2 if call.func.attr == "run_cell_magic" else 1
     if len(call.args) <= text_index or not isinstance(call.args[text_index], ast.Constant):
         return None
     text = call.args[text_index].value
-    return text.strip() if isinstance(text, str) else None
+    return (call.args[0].value, text.strip()) if isinstance(text, str) else None
 
 
 def _history_cell(
@@ -63,9 +69,11 @@ def _history_cell(
         return None
     history = shell.history_manager
     identifier = f"terminal-{number}"
-    question = _question_text(transformed)
-    if question is not None:
-        return {"id": identifier, "type": "markdown", "source": question}
+    magic = _magic_input(transformed)
+    if magic is not None and magic[0] == "question":
+        return {"id": identifier, "type": "markdown", "source": magic[1]}
+    if magic is not None and magic[0] == "output":
+        return {"id": identifier, "type": "raw", "source": source}
 
     outputs: list[dict[str, object]] = []
     for record in history.outputs.get(number, ()):
@@ -139,8 +147,143 @@ class TerminalCellHistory:
     def snapshot(self) -> list[dict[str, object]]:
         return [deepcopy(self._cells[number]) for number in sorted(self._cells)]
 
+    def output_text(self, number: int) -> str:
+        """Format one completed cell's recorded output for IPython's pager."""
+        cell = self._cells.get(number)
+        if cell is None:
+            raise KeyError(number)
+        parts: list[str] = []
+        for output in cell.get("outputs", []):
+            kind = output["output_type"]
+            if kind == "stream":
+                parts.append(output["text"])
+            elif kind in {"execute_result", "display_data"}:
+                data = output["data"]
+                text = data.get("text/plain", data.get("text/markdown"))
+                if text is None:
+                    continue
+                prefix = f"Out[{number}]: " if kind == "execute_result" else ""
+                parts.append(prefix + str(text) + "\n")
+            elif kind == "error":
+                traceback = output.get("traceback") or [
+                    f"{output.get('ename', 'Error')}: {output.get('evalue', '')}"
+                ]
+                parts.append("\n".join(traceback) + "\n")
+        return _plain_ansi("".join(parts))
+
     def close(self) -> None:
         self.shell.events.unregister("post_run_cell", self._callback)
+
+
+class _OutputPreview:
+    """Limit only terminal painting; IPython still records every written byte."""
+
+    def __init__(self, maximum_lines: int, maximum_characters: int) -> None:
+        self.maximum_lines = maximum_lines
+        self.maximum_characters = maximum_characters
+        self.visible_lines = 0
+        self.visible_characters = 0
+        self.hidden_line_breaks = 0
+        self.hidden_has_tail = False
+        self.hidden_characters = 0
+        self.truncated = False
+        self.visible_ends_line = True
+
+    def _hide(self, data: str) -> None:
+        self.truncated = True
+        self.hidden_characters += len(data)
+        self.hidden_line_breaks += data.count("\n") + data.count("\r") - data.count("\r\n")
+        self.hidden_has_tail = not data.endswith(("\n", "\r"))
+
+    def write(self, stream, data: str) -> int:
+        for piece in data.splitlines(keepends=True):
+            remaining = self.maximum_characters - self.visible_characters
+            if self.truncated or self.visible_lines >= self.maximum_lines or remaining <= 0:
+                self._hide(piece)
+                continue
+            visible = piece[:remaining]
+            if len(visible) < len(piece) and "\x1b" in visible:
+                # Never leave a partially printed ANSI escape sequence on screen.
+                visible = ""
+            if visible:
+                if stream.isatty():
+                    stream.write("\x1b[90m")
+                stream.write(visible)
+                if stream.isatty():
+                    stream.write("\x1b[0m")
+                self.visible_characters += len(visible)
+                self.visible_ends_line = visible.endswith(("\n", "\r"))
+                if self.visible_ends_line:
+                    self.visible_lines += 1
+            if len(visible) < len(piece):
+                self._hide(piece[len(visible) :])
+        return len(data)
+
+    def show_notice(self, number: int, error: dict[str, str] | None = None) -> None:
+        if not self.hidden_characters:
+            return
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b[0m")
+        if not self.visible_ends_line:
+            sys.stdout.write("\n")
+        hidden_lines = self.hidden_line_breaks + int(self.hidden_has_tail)
+        label = "line" if hidden_lines == 1 else "lines"
+        sys.stdout.write(
+            f"… {hidden_lines:,} more output {label}. Run %output {number} to view all.\n"
+        )
+        if error is not None:
+            if sys.stdout.isatty():
+                sys.stdout.write("\x1b[90m")
+            sys.stdout.write(f"{error['type']}: {error['message']}\n")
+            if sys.stdout.isatty():
+                sys.stdout.write("\x1b[0m")
+
+
+class _PreviewStream:
+    def __init__(self, stream, preview: _OutputPreview) -> None:
+        self.stream = stream
+        self.preview = preview
+        self.pending = ""
+
+    def write(self, data: str) -> int:
+        self.pending += data
+        lines = self.pending.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self.pending = lines.pop()
+        else:
+            self.pending = ""
+        for line in lines:
+            self.preview.write(self.stream, _plain_ansi(line))
+        return len(data)
+
+    def flush(self) -> None:
+        if self.pending:
+            self.preview.write(self.stream, _plain_ansi(self.pending))
+            self.pending = ""
+        self.stream.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+
+@contextmanager
+def preview_tool_output(
+    maximum_lines: int = _MAXIMUM_VISIBLE_OUTPUT_LINES,
+) -> Iterator[_OutputPreview]:
+    """Show a compact preview while keeping the tool cell's complete native output."""
+    columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+    preview = _OutputPreview(maximum_lines, maximum_lines * max(20, columns))
+    stdout, stderr = sys.stdout, sys.stderr
+    preview_stdout = _PreviewStream(stdout, preview)
+    preview_stderr = _PreviewStream(stderr, preview)
+    sys.stdout = preview_stdout
+    sys.stderr = preview_stderr
+    try:
+        yield preview
+    finally:
+        preview_stdout.flush()
+        preview_stderr.flush()
+        sys.stdout, sys.stderr = stdout, stderr
 
 
 def install_question_mode(shell: TerminalInteractiveShell) -> Callable[[], None]:
@@ -305,6 +448,7 @@ __all__ = [
     "TerminalCellHistory",
     "install_markdown_renderer",
     "install_question_mode",
+    "preview_tool_output",
     "record_tool_output",
     "show_input",
 ]
