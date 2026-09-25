@@ -69,15 +69,16 @@ Load Codebind in a notebook:
 %load_ext codebind
 ```
 
-That is the complete setup. **Question** is a native toolbar toggle:
+That is the complete setup. **Question** is a native toolbar toggle, also available with `Shift+Tab`:
 
 - Turning it on converts the selected cell into a Question and makes each newly created user cell a Question until the toggle is turned off.
-- Codebind-generated instruction, tool, and answer cells are never converted.
+- Turning it off returns the selected unsent Question to a Python code cell.
+- Codebind-generated tool and answer cells are never converted.
 - Write ordinary Markdown and press `Shift+Enter`.
 
 ### Instructions and notebook context
 
-- Loading the extension adds a locked Markdown cell containing Codebind's packaged instructions. Its exact text becomes the conversation's immutable system message and remains stable when the server or kernel restarts.
+- Loading the extension stores Codebind's packaged instructions as the conversation's immutable system message in notebook metadata, without showing an instructions cell. Reopening the notebook or restarting its kernel preserves that message.
 - The whole notebook is model context. Before each Question, Codebind snapshots ordinary Markdown, raw, and code cells—including visible text and image outputs, but never the live Python namespace.
 - Images displayed by the model's IPython tool are included in that tool's result. PNG, JPEG, WebP, GIF, and SVG renditions are prepared as model-visible images; unsupported or oversized images are reported as omissions.
 - The first turn records the snapshot. Later turns append only new, changed, removed, or reordered cells. Existing Questions, tool calls, tool results, and answers in the conversation ledger are not duplicated.
@@ -95,7 +96,7 @@ That is the complete setup. **Question** is a native toolbar toggle:
 - Interrupted saves finish before a turn is cancelled, preventing a restart from turning a partial write into an orphan tool result. An interrupted tool call is closed with an explicit interrupted result.
 - Temporary model transport failures retry the same Question with a fresh connection; repeated WebSocket failures use HTTP. Invalid requests and authentication failures remain visible errors.
 - If a provider stream is cancelled or fails, Codebind discards that provider session before the next Question while retaining the notebook conversation and stable prompt-cache identity.
-- The instruction cell, sent Question cells, model-authored tool cells, and assistant Markdown cells are non-editable and non-deletable. Draft Questions remain editable until sent. Jupyter's standard interrupt button cancels an active Codebind question.
+- Sent Question cells, model-authored tool cells, and assistant Markdown cells are non-editable and non-deletable. Draft Questions remain editable until sent. During an active question, `Ctrl+C` or Jupyter's interrupt button cancels the agent loop; a kernel interrupt is used only if cooperative cancellation does not finish.
 
 ### Markdown and other frontends
 

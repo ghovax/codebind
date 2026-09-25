@@ -421,7 +421,7 @@ def install_markdown_renderer(shell: TerminalInteractiveShell) -> Callable[[], N
 
     def render(text: str, _metadata: object) -> None:
         sys.stdout.write("\n")
-        Console(file=sys.stdout, soft_wrap=True, no_color=shell.colors.lower() == "nocolor").print(
+        Console(file=sys.stdout, no_color=shell.colors.lower() == "nocolor").print(
             Markdown(text)
         )
 

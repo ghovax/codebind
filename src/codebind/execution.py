@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -288,27 +289,42 @@ class IPythonExecutor:
             display_cell(cell)
         transformed = self.shell.transform_cell(cell)
         expression_outputs: list[dict[str, Any]] = []
-        with _captured_execution(
-            self.shell,
-            expression_outputs,
-            bridged=bridged,
-            on_output=on_output,
-            on_clear=on_clear,
-        ) as captured:
-            result = await self.shell.run_cell_async(
-                cell,
-                store_history=True,
-                transformed_cell=transformed,
-            )
-        if bridged:
-            assert bridge is not None and cell_id is not None
-            bridge.finish_code_cell(
-                cell_id,
-                result.execution_count,
-                self._notebook_outputs(result, captured, expression_outputs),
-            )
-        else:
-            captured.show()
+        try:
+            with _captured_execution(
+                self.shell,
+                expression_outputs,
+                bridged=bridged,
+                on_output=on_output,
+                on_clear=on_clear,
+            ) as captured:
+                result = await self.shell.run_cell_async(
+                    cell,
+                    store_history=True,
+                    transformed_cell=transformed,
+                )
+            # IPython records a cancellation raised inside the cell as an execution
+            # error. Keep it as a tool error unless this agent task was cancelled.
+            if asyncio.current_task() and asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
+            if isinstance(result.error_before_exec or result.error_in_exec, KeyboardInterrupt):
+                raise KeyboardInterrupt
+            if bridged:
+                assert bridge is not None and cell_id is not None
+                bridge.finish_code_cell(
+                    cell_id,
+                    result.execution_count,
+                    self._notebook_outputs(result, captured, expression_outputs),
+                )
+            else:
+                captured.show()
+        except BaseException:
+            if bridged:
+                assert bridge is not None and cell_id is not None
+                try:
+                    bridge.cancel_code_cell(cell_id)
+                except Exception:
+                    pass
+            raise
 
         return self._report(result, captured, expression_outputs)
 

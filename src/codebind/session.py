@@ -130,12 +130,8 @@ class Session:
                 conversation.append_message(message, turn_id)
             for turn_id in unfinished:
                 conversation.append("turn_finished", turn_id=turn_id, status="interrupted")
-            sent_instructions = False
             if not conversation.events:
                 conversation.append_message(SystemMessage(self.instructions), "system")
-                if self.bridge is not None:
-                    self.bridge.ensure_instructions_cell(self.instructions)
-                    sent_instructions = True
             if unfinished or value is None:
                 await self._await_durable(self.store.save(conversation.as_dict()))
             self.conversation = conversation
@@ -144,13 +140,6 @@ class Session:
                 (message for message in reversed(self._messages) if isinstance(message, AIMessage)),
                 None,
             )
-            if self.bridge is not None and not sent_instructions:
-                system = next(
-                    (message for message in self._messages if isinstance(message, SystemMessage)),
-                    None,
-                )
-                if system is not None and isinstance(system.content, str):
-                    self.bridge.ensure_instructions_cell(system.content)
 
     async def aload(self) -> None:
         """Load persisted state and prepare the frontend without starting a turn."""
@@ -553,7 +542,7 @@ class Session:
                         self._tool_message(report, identifier),
                         turn_id,
                     )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             self._cancel_assistant_stream(assistant_cell_id)
             await self._seal_interrupted_calls(turn_id)
             await self._append_event("turn_finished", turn_id=turn_id, status="cancelled")

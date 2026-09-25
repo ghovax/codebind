@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 from typing import Any
 
@@ -22,6 +23,9 @@ _STATE_ATTRIBUTE = "_codebind_extension_state"
 
 
 def _close_state(state: dict[str, Any]) -> None:
+    restore_control_interrupt = state.get("restore_control_interrupt")
+    if callable(restore_control_interrupt):
+        restore_control_interrupt()
     restore_output_magic = state.get("restore_output_magic")
     if callable(restore_output_magic):
         restore_output_magic()
@@ -95,6 +99,7 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
         "restore_terminal_question_mode": None,
         "terminal_history": None,
         "restore_output_magic": None,
+        "restore_control_interrupt": None,
     }
 
     if manager is None:
@@ -192,6 +197,29 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
 
         manager.register_target(TARGET_NAME, accept_comm)
         state["comm_target"] = accept_comm
+        control_handlers = getattr(ipython.kernel, "control_handlers", None)
+        if isinstance(control_handlers, dict):
+            previous_interrupt = control_handlers.get("interrupt_request")
+
+            async def interrupt_request(stream: Any, ident: Any, parent: Any) -> None:
+                bridge = state.get("bridge")
+                if isinstance(bridge, JupyterLabBridge):
+                    bridge.request_cancel()
+                if callable(previous_interrupt):
+                    result = previous_interrupt(stream, ident, parent)
+                    if inspect.isawaitable(result):
+                        await result
+
+            control_handlers["interrupt_request"] = interrupt_request
+
+            def restore_control_interrupt() -> None:
+                if control_handlers.get("interrupt_request") is interrupt_request:
+                    if previous_interrupt is None:
+                        control_handlers.pop("interrupt_request", None)
+                    else:
+                        control_handlers["interrupt_request"] = previous_interrupt
+
+            state["restore_control_interrupt"] = restore_control_interrupt
 
     def question_magic(line: str, cell: str | None = None) -> None:
         session = state.get("session")

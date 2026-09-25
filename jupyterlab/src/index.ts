@@ -21,6 +21,7 @@ const INSERT_QUESTION = 'codebind:insert-question';
 const TOGGLE_QUESTION_MODE = 'codebind:toggle-question-mode';
 const RUN_QUESTION = 'codebind:run-question';
 const QUESTION_CLASS = 'jp-CodebindQuestionCell';
+const CANCEL_GRACE_MILLISECONDS = 3000;
 
 interface CodeCellStartedMessage {
   type: 'code_cell_started';
@@ -33,6 +34,11 @@ interface CodeCellFinishedMessage {
   cell_id: string;
   execution_count: number | null;
   outputs: nbformat.IOutput[];
+}
+
+interface CodeCellCancelledMessage {
+  type: 'code_cell_cancelled';
+  cell_id: string;
 }
 
 interface CodeCellOutputMessage {
@@ -66,11 +72,6 @@ interface MarkdownCellCancelledMessage {
   cell_id: string;
 }
 
-interface InstructionsCellMessage {
-  type: 'instructions_cell';
-  source: string;
-}
-
 interface QuestionFinishedMessage {
   type: 'question_finished';
   cell_id: string;
@@ -81,6 +82,10 @@ interface QuestionFinishedMessage {
 interface QuestionStartedMessage {
   type: 'question_started';
   cell_id: string;
+}
+
+interface CancelAcknowledgedMessage {
+  type: 'cancel_acknowledged';
 }
 
 interface SessionReadyMessage {
@@ -97,13 +102,14 @@ interface ConversationSaveMessage {
 type CodebindMessage =
   | CodeCellStartedMessage
   | CodeCellFinishedMessage
+  | CodeCellCancelledMessage
   | CodeCellOutputMessage
   | CodeCellClearMessage
   | MarkdownCellMessage
   | MarkdownCellStreamMessage
   | MarkdownCellCancelledMessage
-  | InstructionsCellMessage
   | QuestionStartedMessage
+  | CancelAcknowledgedMessage
   | QuestionFinishedMessage
   | SessionReadyMessage
   | ConversationSaveMessage;
@@ -127,6 +133,7 @@ interface PanelState {
   runningQuestions: Map<string, ICellModel>;
   questionTimers: Map<string, number>;
   sessionReady: boolean;
+  cancelAcknowledged: boolean;
   questionMode: boolean;
   questionButton: ToolbarButton | null;
   knownCellIds: Set<string>;
@@ -159,23 +166,12 @@ const kernelStates = new WeakMap<
   Set<PanelState>
 >();
 
-function cancelQuestions(state: PanelState): boolean {
-  if (state.runningQuestions.size === 0) {
-    return false;
-  }
-  state.comm?.send({ type: 'cancel' });
-  return true;
-}
-
 function isCodebindMessage(value: unknown): value is CodebindMessage {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
   const message = value as Record<string, unknown>;
-  if (
-    message.type === 'markdown_cell' ||
-    message.type === 'instructions_cell'
-  ) {
+  if (message.type === 'markdown_cell') {
     return typeof message.source === 'string';
   }
   if (
@@ -195,6 +191,9 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
       typeof message.cell_id === 'string' &&
       typeof message.source === 'string'
     );
+  }
+  if (message.type === 'code_cell_cancelled') {
+    return typeof message.cell_id === 'string';
   }
   if (message.type === 'code_cell_output') {
     return (
@@ -219,6 +218,9 @@ function isCodebindMessage(value: unknown): value is CodebindMessage {
   }
   if (message.type === 'question_started') {
     return typeof message.cell_id === 'string';
+  }
+  if (message.type === 'cancel_acknowledged') {
+    return true;
   }
   if (message.type === 'session_ready') {
     const error = message.error;
@@ -263,13 +265,37 @@ function connectInterrupt(
         connected => connected.runningQuestions.size > 0
       );
       for (const connected of active) {
-        cancelQuestions(connected);
+        connected.cancelAcknowledged = false;
       }
-      for (let attempt = 0; active.length > 0 && attempt < 50; attempt += 1) {
-        if (active.every(connected => connected.runningQuestions.size === 0)) {
+      if (active.length > 0) {
+        try {
+          const request = KernelMessage.createMessage<KernelMessage.IInterruptRequestMsg>({
+            session: kernel.clientId,
+            username: kernel.username,
+            channel: 'control',
+            msgType: 'interrupt_request',
+            content: {}
+          });
+          const future = kernel.sendControlMessage(request, true);
+          void future.done.catch(() => undefined);
+        } catch {
+          // The standard kernel interrupt below remains the fallback.
+        }
+      }
+      for (
+        let attempt = 0;
+        active.length > 0 && attempt < CANCEL_GRACE_MILLISECONDS / 20;
+        attempt += 1
+      ) {
+        if (
+          active.every(
+            connected =>
+              connected.runningQuestions.size === 0 || connected.cancelAcknowledged
+          )
+        ) {
           return;
         }
-        await new Promise<void>(resolve => setTimeout(resolve, 10));
+        await new Promise<void>(resolve => setTimeout(resolve, 20));
       }
       return interrupt();
     };
@@ -412,11 +438,13 @@ function refreshQuestionCells(panel: NotebookPanel): void {
     if (question) {
       cell.readOnly = question.status === 'sent';
       prompt.dataset.codebindQuestion = 'true';
+      prompt.style.color = '#a855f7';
       prompt.textContent = state?.runningQuestions.has(cell.model.id)
         ? '[*]:'
         : '[ ]:';
     } else if (prompt.dataset.codebindQuestion) {
       delete prompt.dataset.codebindQuestion;
+      prompt.style.removeProperty('color');
       prompt.textContent = '';
     }
   }
@@ -469,49 +497,20 @@ function insertCell(
   return cell?.model ?? null;
 }
 
-function ensureInstructionsCell(panel: NotebookPanel, source: string): void {
+function hideInstructionsCells(panel: NotebookPanel): void {
   const notebook = panel.content;
-  const model = notebook.model;
-  if (!model) {
-    return;
-  }
-  let index = notebook.widgets.findIndex(
-    widget => codebindKind(widget.model) === 'instructions'
-  );
-  if (index < 0) {
-    const activeId = notebook.activeCell?.model.id ?? null;
-    model.sharedModel.insertCell(0, {
-      cell_type: 'markdown',
-      source,
-      metadata: {
-        editable: false,
-        deletable: false,
-        codebind: { kind: 'instructions' }
-      }
-    });
-    index = 0;
-    if (activeId !== null) {
-      const activeIndex = notebook.widgets.findIndex(
-        widget => widget.model.id === activeId
-      );
-      if (activeIndex >= 0) {
-        notebook.activeCellIndex = activeIndex;
-      }
+  for (const cell of notebook.widgets) {
+    if (codebindKind(cell.model) === 'instructions') {
+      cell.node.hidden = true;
     }
   }
-  const cell = notebook.widgets[index];
-  if (!cell) {
-    return;
-  }
-  if (cell.model.sharedModel.getSource() !== source) {
-    cell.model.sharedModel.setSource(source);
-  }
-  cell.model.setMetadata('editable', false);
-  cell.model.setMetadata('deletable', false);
-  cell.model.setMetadata('codebind', { kind: 'instructions' });
-  cell.readOnly = true;
-  if (cell instanceof MarkdownCell) {
-    cell.rendered = true;
+  if (notebook.activeCell && codebindKind(notebook.activeCell.model) === 'instructions') {
+    const next = notebook.widgets.findIndex(
+      cell => codebindKind(cell.model) !== 'instructions'
+    );
+    if (next >= 0) {
+      notebook.activeCellIndex = next;
+    }
   }
 }
 
@@ -534,6 +533,7 @@ function registerKernel(panel: NotebookPanel): void {
     runningQuestions: new Map<string, ICellModel>(),
     questionTimers: new Map<string, number>(),
     sessionReady: false,
+    cancelAcknowledged: false,
     questionMode: false,
     questionButton: null,
     knownCellIds: new Set(panel.content.widgets.map(widget => widget.model.id)),
@@ -561,6 +561,7 @@ function registerKernel(panel: NotebookPanel): void {
   }
   panelState.questionTimers.clear();
   panelState.sessionReady = false;
+  panelState.cancelAcknowledged = false;
 
   let turn: TurnState | null = null;
   const codeCells = new Map<string, ICodeCellModel>();
@@ -659,10 +660,6 @@ function registerKernel(panel: NotebookPanel): void {
         );
         return;
       }
-      if (data.type === 'instructions_cell') {
-        ensureInstructionsCell(panel, data.source);
-        return;
-      }
       if (data.type === 'session_ready') {
         panelState.sessionReady = data.error === null;
         if (data.error) {
@@ -686,6 +683,10 @@ function registerKernel(panel: NotebookPanel): void {
         }
         return;
       }
+      if (data.type === 'cancel_acknowledged') {
+        panelState.cancelAcknowledged = true;
+        return;
+      }
       if (data.type === 'question_finished') {
         const timer = panelState.questionTimers.get(data.cell_id);
         if (timer !== undefined) {
@@ -693,6 +694,9 @@ function registerKernel(panel: NotebookPanel): void {
           panelState.questionTimers.delete(data.cell_id);
         }
         panelState.runningQuestions.delete(data.cell_id);
+        if (panelState.runningQuestions.size === 0) {
+          panelState.cancelAcknowledged = false;
+        }
         refreshQuestionCells(panel);
         finishTurn();
         if (data.error && !data.cancelled) {
@@ -747,6 +751,7 @@ function registerKernel(panel: NotebookPanel): void {
       }
       if (data.type === 'code_cell_finished') {
         const model = codeCells.get(data.cell_id);
+        codeCells.delete(data.cell_id);
         if (!model) {
           return;
         }
@@ -759,6 +764,14 @@ function registerKernel(panel: NotebookPanel): void {
           data.execution_count !== null
         ) {
           turn.parentExecutionCount = data.execution_count - 1;
+        }
+        return;
+      }
+      if (data.type === 'code_cell_cancelled') {
+        const model = codeCells.get(data.cell_id);
+        codeCells.delete(data.cell_id);
+        if (model) {
+          model.executionState = 'idle';
         }
         return;
       }
@@ -788,6 +801,17 @@ function registerKernel(panel: NotebookPanel): void {
     comm.onClose = () => {
       if (panelState.comm === comm) {
         const wasReady = panelState.sessionReady;
+        for (const model of codeCells.values()) {
+          model.executionState = 'idle';
+        }
+        codeCells.clear();
+        panelState.runningQuestions.clear();
+        panelState.cancelAcknowledged = false;
+        for (const timer of panelState.questionTimers.values()) {
+          window.clearTimeout(timer);
+        }
+        panelState.questionTimers.clear();
+        refreshQuestionCells(panel);
         panelState.rejectReady?.(
           new Error(
             'Codebind is not loaded in this kernel. Run %load_ext codebind.'
@@ -878,6 +902,7 @@ function refreshQuestionMode(panel: NotebookPanel): void {
   if (!state) {
     return;
   }
+  hideInstructionsCells(panel);
   const widgets = panel.content.widgets;
   const currentIds = new Set(widgets.map(widget => widget.model.id));
   const added = widgets.filter(widget => !state.knownCellIds.has(widget.model.id));
@@ -919,6 +944,13 @@ function setQuestionMode(panel: NotebookPanel, enabled: boolean): void {
   state.questionMode = enabled;
   if (!state.questionMode) {
     state.pendingQuestionCellIds.clear();
+    const active = panel.content.activeCell;
+    if (active && questionMetadata(active.model)?.status === 'draft') {
+      active.model.deleteMetadata('codebind');
+      NotebookActions.changeCellType(panel.content, 'code');
+      panel.content.mode = 'edit';
+      panel.content.activeCell?.editor?.focus();
+    }
   }
   if (state.questionButton) {
     state.questionButton.pressed = state.questionMode;
@@ -1004,6 +1036,7 @@ async function runQuestion(panel: NotebookPanel): Promise<void> {
     return;
   }
   state.runningQuestions.set(cell.model.id, cell.model);
+  state.cancelAcknowledged = false;
   cell.model.sharedModel.setSource(normalizeMathDelimiters(question));
   cell.model.setMetadata('codebind', { kind: 'question', status: 'sent' });
   cell.model.setMetadata('editable', false);
@@ -1053,25 +1086,82 @@ function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
     runningQuestions: new Map<string, ICellModel>(),
     questionTimers: new Map<string, number>(),
     sessionReady: false,
+    cancelAcknowledged: false,
     questionMode: false,
     questionButton: null,
     knownCellIds: new Set(panel.content.widgets.map(widget => widget.model.id)),
     pendingQuestionCellIds: new Set<string>()
   };
   panelStates.set(panel, state);
+  let interruptPending = false;
+  const requestInterrupt = (): void => {
+    if (interruptPending) {
+      return;
+    }
+    if (!state.kernel) {
+      if (state.runningQuestions.size > 0) {
+        state.cancelAcknowledged = false;
+        state.comm?.send({ type: 'cancel' });
+      }
+      return;
+    }
+    interruptPending = true;
+    void state.kernel
+      .interrupt()
+      .catch(error => {
+        if (state.runningQuestions.size > 0) {
+          void showErrorMessage('Codebind could not interrupt', String(error));
+        }
+      })
+      .finally(() => {
+        interruptPending = false;
+      });
+  };
   const onInterrupt = (event: Event): void => {
-    if (!cancelQuestions(state)) {
+    if (state.runningQuestions.size === 0) {
       return;
     }
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    window.setTimeout(() => {
-      if (state.runningQuestions.size > 0) {
-        void state.kernel?.interrupt();
-      }
-    }, 500);
+    requestInterrupt();
   };
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (
+      event.key === 'Tab' &&
+      event.shiftKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      event.target instanceof Node &&
+      panel.content.node.contains(event.target)
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      toggleQuestionMode(panel);
+      app.commands.notifyCommandChanged(TOGGLE_QUESTION_MODE);
+    }
+  };
+  const onGlobalKeyDown = (event: KeyboardEvent): void => {
+    if (
+      state.runningQuestions.size === 0 ||
+      app.shell.currentWidget !== panel ||
+      event.key.toLowerCase() !== 'c' ||
+      !event.ctrlKey ||
+      event.altKey ||
+      event.metaKey ||
+      event.shiftKey
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    requestInterrupt();
+  };
+  panel.node.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('keydown', onGlobalKeyDown, true);
   let interruptButton: HTMLElement | null = null;
   const connectInterruptButton = (): void => {
     const button = panel.toolbar.node.querySelector<HTMLElement>(
@@ -1095,6 +1185,8 @@ function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
     toolbarObserver.disconnect();
     cellObserver.disconnect();
     interruptButton?.removeEventListener('click', onInterrupt, true);
+    panel.node.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('keydown', onGlobalKeyDown, true);
     state.disconnectKernel?.();
     state.rejectReady?.(new Error('The notebook closed.'));
     state.comm?.close();
@@ -1126,6 +1218,7 @@ function connectPanel(panel: NotebookPanel, app: JupyterFrontEnd): void {
   });
   panel.content.activeCellChanged.connect(() => refreshQuestionMode(panel));
   void panel.context.ready.then(() => {
+    hideInstructionsCells(panel);
     panel.content.model?.cells.changed.connect(() => {
       refreshQuestionMode(panel);
       window.setTimeout(() => refreshQuestionMode(panel), 0);

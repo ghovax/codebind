@@ -17,6 +17,7 @@ class JupyterLabBridge:
 
     def __init__(self, comm: Any, conversation: dict[str, Any] | None) -> None:
         self._comm = comm
+        self._loop = asyncio.get_running_loop()
         self._question_handler: _QuestionHandler | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._conversation = conversation
@@ -35,7 +36,8 @@ class JupyterLabBridge:
 
     def _stop(self) -> None:
         for task in self._tasks:
-            task.cancel()
+            if not task.done() and not task.cancelling():
+                task.cancel()
         self._tasks.clear()
         for future in self._save_waiters.values():
             future.cancel()
@@ -45,6 +47,28 @@ class JupyterLabBridge:
     def handle_questions(self, handler: _QuestionHandler) -> None:
         """Handle questions submitted by Codebind cells."""
         self._question_handler = handler
+
+    def request_cancel(self) -> None:
+        """Cancel active questions safely from shell or control-channel callbacks."""
+        if not self.ready:
+            return
+
+        def cancel_on_loop() -> None:
+            if not self.ready:
+                return
+            for task in tuple(self._tasks):
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            self._comm.send({"type": "cancel_acknowledged"})
+
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if current is self._loop:
+            cancel_on_loop()
+        else:
+            self._loop.call_soon_threadsafe(cancel_on_loop)
 
     async def load_conversation(self) -> dict[str, Any] | None:
         return self._conversation
@@ -98,6 +122,13 @@ class JupyterLabBridge:
                 "outputs": outputs,
             }
         )
+        return True
+
+    def cancel_code_cell(self, cell_id: str) -> bool:
+        """Return an interrupted code cell to JupyterLab's idle state."""
+        if not self.ready:
+            return False
+        self._comm.send({"type": "code_cell_cancelled", "cell_id": cell_id})
         return True
 
     def append_code_output(self, cell_id: str, output: dict[str, Any]) -> bool:
@@ -180,13 +211,6 @@ class JupyterLabBridge:
         self._comm.send({"type": "markdown_cell_cancelled", "cell_id": cell_id})
         return True
 
-    def ensure_instructions_cell(self, source: str) -> bool:
-        """Show the conversation's immutable system instructions in the notebook."""
-        if not self.ready:
-            return False
-        self._comm.send({"type": "instructions_cell", "source": source})
-        return True
-
     def report_session_ready(self, error: BaseException | None = None) -> None:
         """Tell JupyterLab whether persisted conversation state is ready."""
         self._comm.send(
@@ -201,6 +225,8 @@ class JupyterLabBridge:
         )
 
     def _on_message(self, message: dict[str, Any]) -> None:
+        if not self.ready:
+            return
         data = message.get("content", {}).get("data", {})
         if not isinstance(data, dict):
             return
@@ -216,8 +242,7 @@ class JupyterLabBridge:
                 future.set_result(None)
             return
         if data.get("type") == "cancel":
-            for task in tuple(self._tasks):
-                task.cancel()
+            self.request_cancel()
             return
         if data.get("type") != "question":
             return
@@ -245,15 +270,16 @@ class JupyterLabBridge:
             if self._question_handler is None:
                 raise RuntimeError("Codebind is not ready to receive questions.")
             await self._question_handler(question, notebook)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             cancelled = True
         except Exception as exception:
             error = {"type": type(exception).__name__, "message": str(exception)}
-        self._comm.send(
-            {
-                "type": "question_finished",
-                "cell_id": cell_id,
-                "error": error,
-                "cancelled": cancelled,
-            }
-        )
+        if self.ready:
+            self._comm.send(
+                {
+                    "type": "question_finished",
+                    "cell_id": cell_id,
+                    "error": error,
+                    "cancelled": cancelled,
+                }
+            )
